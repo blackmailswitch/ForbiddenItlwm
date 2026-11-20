@@ -16,16 +16,18 @@ What's being worked on, what comes next, and what's planned further out. These a
 - **Faster normal Wi-Fi while AirDrop is on.** The Mac's own Wi-Fi loses about 30 to 45% of its speed while AirDrop's listener runs, because the two share the radio. Giving the listener less airtime while nothing is being sent should win most of that back.
 - **Wi-Fi 6 by default.** The driver can use Wi-Fi 6 (802.11ax), but only with the boot argument `itlwm_he=1`, which comes from the upstream code. One tester runs it with AirDrop without problems ([#58](https://github.com/retropineaple/ForbiddenItlwm/issues/58)); the goal is to test it here and turn it on by default.
 - **Faster connects.** A cold iPhone → Mac connect takes 3 to 10 s, mostly before any data moves. The target is under 2 s in both directions.
+- **AirDrop's channel picked the way macOS picks it** ([#35](https://github.com/retropineaple/ForbiddenItlwm/issues/35), [#68](https://github.com/retropineaple/ForbiddenItlwm/issues/68)). macOS works out its own AirDrop channels with Apple's rules, but the listener still guesses from what nearby devices announce. The next test build publishes macOS's choice; if testers' results show it's the better one, the listener will follow it. With two devices on different channels, the listener should also follow the one it's exchanging files with.
 - **More macOS builds:** Sequoia 15.6 ([#19](https://github.com/retropineaple/ForbiddenItlwm/issues/19)) and each new Tahoe or Sequoia update, checked against Apple's Kernel Debug Kit before AirDrop is switched on for it.
 
 ## Later
 
 - **Instant Hotspot:** joining the iPhone's hotspot from the Wi-Fi menu without typing the password. It starts with a Bluetooth LE connection to the iPhone, which times out today ([#39](https://github.com/retropineaple/ForbiddenItlwm/issues/39), [#40](https://github.com/retropineaple/ForbiddenItlwm/issues/40)).
 - **Sidecar and Universal Control over Wi-Fi** ([#42](https://github.com/retropineaple/ForbiddenItlwm/issues/42)): they need AWDL traffic registration, which the driver doesn't support yet. Sidecar over USB works. AirPlay over this driver already works for users, in both directions (#29, #42).
-- **Continuity Camera:** using the iPhone as the Mac's webcam.
+- **More than one AirDrop channel at a time, like a real Mac (research).** Apple devices change channel 16 times in each quarter of a second, following a shared schedule, so they can meet a device on 149 and another on 44, and their own Wi-Fi in between. The listener stays on one channel. Intel's firmware can be told to be on a channel at set times, and that might let it follow macOS's schedule slot by slot. It's an experiment first: it isn't known yet whether this firmware allows it.
+- **Continuity Camera:** using the iPhone as the Mac's webcam ([PR #72](https://github.com/retropineaple/ForbiddenItlwm/pull/72)).
 - **A unified Bluetooth kext that survives macOS updates:** one Bluetooth kext made for ForbiddenItlwm, replacing BTLEAdvFixup, IntelBluetoothFirmware and BlueToolFixup, with patches that keep working across small macOS updates.
 - **A look at Ventura 13.** Ventura needs its own study of that version's Wi-Fi stack first, so it isn't certain.
-- **Sleep and wake:** not tested on the project's hackintosh, where sleep is disabled. One user reports two nights of scheduled sleep with AirDrop on and no problems ([#38](https://github.com/retropineaple/ForbiddenItlwm/issues/38)).
+- **Sleep and wake:** not tested on the project's hackintosh, where sleep is disabled. One user reports five nights of scheduled sleep with AirDrop on: four woke normally, and on one the driver stayed unavailable until Wi-Fi was turned off and on ([#38](https://github.com/retropineaple/ForbiddenItlwm/issues/38)).
 
 ## Not planned
 

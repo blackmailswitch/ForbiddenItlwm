@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0-beta.2
+
+**Bluetooth: BTLEAdvFixup 0.9.3**
+- **New BLE mice and keyboards pair again ([#71](https://github.com/retropineaple/ForbiddenItlwm/issues/71)).** A security fix in 0.9.2 forgot the controller's event pipe on its first command, so the LE data-length fix never ran and no `BTLEAdvLength*` key appeared. The pipe is now kept. New key `BTLEAdvEventPipes`.
+
+**AirDrop**
+- **The listener no longer jumps between 44 and 149 ([#68](https://github.com/retropineaple/ForbiddenItlwm/issues/68)).** It followed the last channel sequence heard from any nearby device, which can change every few seconds, and each move dropped block ack, so transfers were cut off. A move between two 5 GHz channels now needs the same choice for 60 s and no AirDrop data for 30 s. It still moves at once when the device never comes to the current channel, and to or from channel 6. New key `ITLAWDLCoexMovesSettleDropped`.
+- **`-itlawdlsta44` (test flag, [PR #75](https://github.com/retropineaple/ForbiddenItlwm/pull/75), thanks to Gyuri1999):** with the Mac's Wi-Fi on 44 and the other device seen on 44 too, the listener shares 44. 27 MB/s with a MacBook Air M1; not tested with iPhones.
+- **`-itlawdlanybuild` now turns AirDrop on fully** on a macOS build the driver hasn't verified, the announcement included, so a new build can really be tested (before, other devices never listed the Mac there). `ItlwmAWDLMiState` reads "on (unverified build, -itlawdlanybuild)". Still a panic risk; use a USB stick.
+- **The AirDrop channels macOS asks for are published** (`ItlwmAWDLReqSeqChannels`, `ItlwmAWDLReqMasterChannel`, `ItlwmAWDLReqSecondaryMasterChannel`), to compare with the listener's own choice. Nothing follows them yet.
+
+**Wi-Fi**
+- **Joining in crowded places and on 802.1X (Enterprise) networks ([#69](https://github.com/retropineaple/ForbiddenItlwm/issues/69), from runmain's patch).** With more networks in range than the scan cache holds, the network macOS asked to join was dropped before the scan ended; it's now kept. On 802.1X networks the link now comes up at association, so macOS's EAP login can go out (everything else is still held back until the keys are installed). Tested on an AX210 with WPA2-Enterprise; not tested here.
+- **Opt-in `itlwm_scanout` and `itlwm_lqmint` ([PR #66](https://github.com/retropineaple/ForbiddenItlwm/pull/66), thanks to alikaylan, [#64](https://github.com/retropineaple/ForbiddenItlwm/issues/64)):** faster full scans while connected, and fewer link-quality updates. Both off by default.
+
+**Tools**
+- `check_compat.sh` checks the whole tested flag set and the announcement ([PR #74](https://github.com/retropineaple/ForbiddenItlwm/pull/74), thanks to Gyuri1999), finds a driver kmutil doesn't list ([#73](https://github.com/retropineaple/ForbiddenItlwm/issues/73)), and no longer warns about channel 6 when the listener is already on 149 or 44 without a country.
+
+**Docs:** TROUBLESHOOTING covers the listener moving between 44 and 149, a missing SMBIOS serial ([#46](https://github.com/retropineaple/ForbiddenItlwm/issues/46)), a slow Wi-Fi menu with many remembered networks (#64) and BTLEAdvFixup 0.9.2 with BLE mice. ROADMAP adds macOS's channel choice and multi-channel research. TESTED-HARDWARE adds AirDrop with a Mac as the other device and the #38 sleep results.
+
+**Tested on** the project's hackintosh (Tahoe 26.7.1, AX211): AirDrop both ways, Bluetooth headphones, the listener on 149 at 80 MHz with no moves, `BTLEAdvEventPipes` 1. Not tested here: BLE mice (no device), 802.1X, `-itlawdlsta44`, `-itlawdlanybuild`, the Sequoia and Sonoma builds (built and checked offline).
+
 ## 0.6.0-beta.1
 
 The first beta of 0.6.0. Everything since 0.5.4-beta.2, including what 0.6.0-alpha.1 tested:

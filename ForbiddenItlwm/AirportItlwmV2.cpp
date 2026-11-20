@@ -85,6 +85,7 @@ IOReturn ItlAWDLInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_pee
 }
 
 extern bool itlAWDLBuildVerified();
+extern bool itlAWDLBuildForced();
 
 void ItlAWDLInterface::acceptNativeRequests()
 {
@@ -93,10 +94,15 @@ void ItlAWDLInterface::acceptNativeRequests()
     int debug = 0;
     debugFlagsWanted = PE_parse_boot_argn("-itlawdlpmdebug", &debug, sizeof(debug));
     // The request carries a raw pointer at a fixed offset, a layout checked only for the verified
-    // builds. On any other build (expected, or allowed by -itlawdlanybuild) the copy stays off.
+    // builds. On an "expected" build the copy stays off. With -itlawdlanybuild it's on too, so an unverified
+    // build can be tested with AirDrop working (other devices list the Mac only with it): the pointer is then
+    // still range-checked and the copy validated (storeMasterIndication), but the layout isn't known to match.
     const bool wanted = PE_parse_boot_argn("-itlawdlmitx", &debug, sizeof(debug));
-    masterIndicationEnabled = wanted && itlAWDLBuildVerified();
-    setProperty("ItlwmAWDLMiState", !wanted ? "off" : masterIndicationEnabled ? "on" : "blocked: build not verified");
+    const bool verified = itlAWDLBuildVerified();
+    const bool forced = !verified && itlAWDLBuildForced();
+    masterIndicationEnabled = wanted && (verified || forced);
+    setProperty("ItlwmAWDLMiState", !wanted ? "off" : !masterIndicationEnabled ? "blocked: build not verified" :
+                forced ? "on (unverified build, -itlawdlanybuild)" : "on");
 }
 
 IOReturn ItlAWDLInterface::getAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode *data)
@@ -286,6 +292,73 @@ IOReturn ItlAWDLInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state *data)
     }
     if (result == kIOReturnSuccess && nativeState.accept)
         setProperty("ItlwmAWDLSyncStateRequested", data->state, 32);
+    return result;
+}
+
+// macOS works out this Mac's AWDL schedule with Apple's own rules and hands it down here. The listener picks
+// its channel from what it hears instead (#17, #35, #68), so these are published to compare the two:
+// ItlwmAWDLReqSeqHeader (length, encoding, step and duplicate counts, fill channel), ItlwmAWDLReqSeqChannels
+// (each entry's channel number), ItlwmAWDLReqSeqRaw (the whole request),
+// ItlwmAWDLReqMasterChannel and ItlwmAWDLReqSecondaryMasterChannel. Published only: nothing follows them yet.
+IOReturn ItlAWDLInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple80211_awdl_sync_channel_sequence *data)
+{
+    const IOReturn result = storeRequested(requested_AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE, data,
+                                           "AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE");
+    if (result == kIOReturnSuccess)
+        publishRequestedSequence();
+    return result;
+}
+
+void ItlAWDLInterface::publishRequestedSequence()
+{
+    // Read back our own stored copy, not the caller's buffer.
+    apple80211_awdl_sync_channel_sequence copy {};
+    if (readRequested(requested_AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE, &copy) != kIOReturnSuccess)
+        return;
+    // The header's declared 3-byte entries don't match what Tahoe sends: the first boot (25G241) showed
+    // 12-byte entries, {channel, flags, a third word} as 32-bit words (149, 0x10, 1). The channel list below
+    // reads that layout; the raw copy is the whole request, so another layout can be checked offline.
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&copy);
+    const unsigned maxEntries = unsigned((sizeof(copy) - 16) / 12);
+    const unsigned entries = copy.length < maxEntries ? copy.length : maxEntries;
+    uint8_t channels[(sizeof(copy) - 16) / 12] = {};
+    for (unsigned i = 0; i < entries; ++i) {
+        uint32_t channel;
+        memcpy(&channel, bytes + 16 + 12 * i, sizeof(channel));
+        channels[i] = channel > 0xff ? 0xff : uint8_t(channel);
+    }
+    char header[96];
+    snprintf(header, sizeof(header), "len=%u enc=%u step=%u dup=%u fill=%u", copy.length, copy.encoding,
+             copy.step_count, copy.duplicate_count, copy.fill_channel);
+    setProperty("ItlwmAWDLReqSeqHeader", header);
+    if (auto *list = OSData::withBytes(channels, entries)) {
+        setProperty("ItlwmAWDLReqSeqChannels", list);
+        list->release();
+    }
+    if (auto *raw = OSData::withBytes(&copy, unsigned(sizeof(copy)))) {
+        setProperty("ItlwmAWDLReqSeqRaw", raw);
+        raw->release();
+    }
+    setProperty("ItlwmAWDLReqSeqSets", ++requestedSequenceSets, 32);
+}
+
+IOReturn ItlAWDLInterface::setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *data)
+{
+    const IOReturn result = storeRequested(requested_AWDL_MASTER_CHANNEL, data, "AWDL_MASTER_CHANNEL");
+    apple80211_awdl_master_channel copy {};
+    if (result == kIOReturnSuccess && readRequested(requested_AWDL_MASTER_CHANNEL, &copy) == kIOReturnSuccess)
+        setProperty("ItlwmAWDLReqMasterChannel", copy.master_channel, 32);
+    return result;
+}
+
+IOReturn ItlAWDLInterface::setAWDL_SECONDARY_MASTER_CHANNEL(apple80211_awdl_secondary_master_channel *data)
+{
+    const IOReturn result = storeRequested(requested_AWDL_SECONDARY_MASTER_CHANNEL, data,
+                                           "AWDL_SECONDARY_MASTER_CHANNEL");
+    apple80211_awdl_secondary_master_channel copy {};
+    if (result == kIOReturnSuccess &&
+        readRequested(requested_AWDL_SECONDARY_MASTER_CHANNEL, &copy) == kIOReturnSuccess)
+        setProperty("ItlwmAWDLReqSecondaryMasterChannel", copy.secondary_master_channel, 32);
     return result;
 }
 
@@ -1755,6 +1828,23 @@ bool AirportItlwm::startDriver(IOService *provider)
     int he_enabled = 0;
     if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
+    // itlwm_scanout=N (120..480 TU): longer visits off the home channel during full scans while
+    // associated, so several passive channels are covered per visit. Out of range or unset: 120.
+    {
+        extern uint32_t itlScanMaxOutTU;
+        uint32_t scanOut = 0;
+        if (PE_parse_boot_argn("itlwm_scanout", &scanOut, sizeof(scanOut)) && scanOut >= 120 && scanOut <= 480)
+            itlScanMaxOutTU = scanOut;
+        setProperty("ItlwmScanMaxOutTU", itlScanMaxOutTU ? itlScanMaxOutTU : 120U, 32);
+    }
+    // itlwm_lqmint=N (1..60 s): link-quality updates to WCL only on a 3 dB RSSI change or every N s.
+    {
+        extern uint32_t itlLqmMinIntervalSec;
+        uint32_t lqmInterval = 0;
+        if (PE_parse_boot_argn("itlwm_lqmint", &lqmInterval, sizeof(lqmInterval)) && lqmInterval >= 1 && lqmInterval <= 60)
+            itlLqmMinIntervalSec = lqmInterval;
+        setProperty("ItlwmLqmMinIntervalSec", itlLqmMinIntervalSec, 32);
+    }
 #endif
 
     if (!fHalService->attach(pciNub)) {
