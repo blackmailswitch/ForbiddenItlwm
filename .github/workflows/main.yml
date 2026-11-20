@@ -10,59 +10,58 @@ permissions:
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: ${{ matrix.platform }} (${{ matrix.configuration }})
-    runs-on: macos-15-intel
+    name: ForbiddenItlwm (${{ matrix.target }})
+    # tools/build.py cross-compiles for x86_64 (-arch x86_64) with the Command Line
+    # Tools and MacKernelSDK only, so an Apple Silicon runner is enough. The
+    # macos-15-intel runners are scarce and jobs often never got one.
+    runs-on: macos-15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        platform: [Sequoia, Tahoe]
-        configuration: [Debug, Release]
+        # One kext per macOS version; never load one on another macOS version.
+        target: [sequoia, tahoe, sonoma]
     steps:
       - uses: actions/checkout@v4
       - name: Install MacKernelSDK
         uses: actions/checkout@v4
         with:
           repository: acidanthera/MacKernelSDK
+          # The commit docs/INSTALL.md says was tested.
           ref: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
           path: MacKernelSDK
-      - name: Build AirportItlwm for ${{ matrix.platform }}
+      - name: Build ForbiddenItlwm for ${{ matrix.target }}
         env:
-          CONFIGURATION: ${{ matrix.configuration }}
-          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p logs
-          xcodebuild -project itlwm.xcodeproj -scheme "AirportItlwm-$PLATFORM" \
-            -configuration "$CONFIGURATION" -jobs 3 ARCHS=x86_64 \
-            SYMROOT="$PWD/build/products" OBJROOT="$PWD/build/obj" \
-            CODE_SIGNING_ALLOWED=NO GIT_COMMIT="_$(git rev-parse --short HEAD)" \
-            build > "logs/AirportItlwm-$PLATFORM.log" 2>&1 || { tail -100 "logs/AirportItlwm-$PLATFORM.log"; exit 1; }
+          python3 tools/build.py --target "$TARGET" --out "build/$TARGET" -j 4 \
+            > "logs/ForbiddenItlwm-$TARGET.log" 2>&1 || { tail -100 "logs/ForbiddenItlwm-$TARGET.log"; exit 1; }
+          tail -5 "logs/ForbiddenItlwm-$TARGET.log"
       - name: Package kernel extension
         env:
-          CONFIGURATION: ${{ matrix.configuration }}
-          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          products="$PWD/build/products/$CONFIGURATION"
-          version=$(awk '/MODULE_VERSION =/ {gsub(/;/, "", $3); print $3; exit}' itlwm.xcodeproj/project.pbxproj)
+          version=$(sed -n "s/.*VER='\([^']*\)'.*/\1/p" tools/build.py | head -n 1)
           short_sha=$(git rev-parse --short HEAD)
-          configuration=$(printf '%s' "$CONFIGURATION" | tr '[:lower:]' '[:upper:]')
-          suffix="v$version-$configuration-alpha-$short_sha"
-          ditto -c -k --keepParent "$products/$PLATFORM/AirportItlwm.kext" "artifacts/AirportItlwm-$PLATFORM-$suffix.zip"
+          ditto -c -k --keepParent "build/$TARGET/ForbiddenItlwm.kext" \
+            "artifacts/ForbiddenItlwm-$TARGET-v$version-alpha-$short_sha.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-${{ matrix.platform }}-${{ matrix.configuration }}
-          path: artifacts/AirportItlwm-${{ matrix.platform }}-*.zip
+          name: ForbiddenItlwm-${{ matrix.target }}
+          path: artifacts/ForbiddenItlwm-${{ matrix.target }}-*.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: build-logs-${{ matrix.platform }}-${{ matrix.configuration }}
+          name: build-logs-${{ matrix.target }}
           path: logs
 
   prerelease:
@@ -78,7 +77,7 @@ jobs:
           fetch-depth: 5
       - uses: actions/download-artifact@v4
         with:
-          pattern: AirportItlwm-*
+          pattern: ForbiddenItlwm-*
           path: artifacts
           merge-multiple: true
       - name: Publish alpha artifacts
@@ -86,7 +85,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          version=$(awk '/MODULE_VERSION =/ {gsub(/;/, "", $3); print $3; exit}' itlwm.xcodeproj/project.pbxproj)
+          version=$(sed -n "s/.*VER='\([^']*\)'.*/\1/p" tools/build.py | head -n 1)
           tag="v$version-alpha"
           printf '%s\n\n' 'Development build. Hardware validation is required before daily use.' > ReleaseNotes.md
           git log -5 --format='- %h %s' >> ReleaseNotes.md
@@ -99,9 +98,10 @@ jobs:
           else
             gh release create "$tag" --target "$GITHUB_SHA" --prerelease --title "$tag" --notes-file ReleaseNotes.md
           fi
-          gh release upload "$tag" artifacts/AirportItlwm-*.zip --clobber
+          gh release upload "$tag" artifacts/ForbiddenItlwm-*.zip --clobber
 
-          # Remove obsolete assets only after the replacement set has uploaded.
+          # Remove obsolete assets of this development release only, after the
+          # replacement set has uploaded. Other releases are left alone.
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
             --jq '.assets[] | [.id, .name] | @tsv' > release-assets.tsv
           while IFS=$'\t' read -r asset_id asset_name; do
@@ -109,12 +109,3 @@ jobs:
               gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
             fi
           done < release-assets.tsv
-
-          # Keep exactly one prerelease; stable releases are retained.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-            --jq '.[] | select(.prerelease and (.draft | not)) | .tag_name' > prereleases.txt
-          while IFS= read -r old_tag; do
-            if [[ "$old_tag" != "$tag" ]]; then
-              gh release delete "$old_tag" --yes --cleanup-tag
-            fi
-          done < prereleases.txt
