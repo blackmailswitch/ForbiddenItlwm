@@ -14494,9 +14494,9 @@ iwx_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action,
             // here, so there are no beacons, and nothing in monitor mode acts on missing them.
             cmd.sta.is_assoc = htole32(action != IWX_FW_CTXT_ACTION_ADD);
             cmd.sta.bi = htole32(100);
-            cmd.sta.bi_reciprocal = htole32(iwx_reciprocal(100));
             cmd.sta.dtim_interval = htole32(100);
-            cmd.sta.dtim_reciprocal = htole32(iwx_reciprocal(100));
+            // STA_MAC_DATA_API_S_VER_2 has no reciprocals: the two fields are reserved1 and
+            // data_policy (TWT/coex bits), which must stay 0 (cmd is zeroed).
             cmd.sta.listen_interval = htole32(10);
             cmd.sta.assoc_id = htole32(1);
         }
