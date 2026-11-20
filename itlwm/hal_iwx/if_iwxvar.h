@@ -341,8 +341,19 @@ struct iwx_tx_data {
 #define IWX_TXDATA_FLAG_CMD_IS_NARROW  0x01
 #define IWX_TXDATA_FLAG_CMD_PENDING    0x02
 #define IWX_TXDATA_FLAG_CMD_WAITING    0x04
+#define IWX_TXDATA_FLAG_LEAVE_DEAUTH   0x08 /* the deauth ic_deauth_tx_pending waits for */
     uint8_t type;
 };
+
+/*
+ * TX A-MSDU limits. The body of an A-MSDU must fit one slot's TX buffer:
+ * IWX_AMSDU_MAX_BODY for rings with the default buffers (4 KB with AppleVTD),
+ * IWX_AMSDU_MAP_SIZE for Block Ack queues, for A-MSDUs up to ~11 KB
+ * (iwlwifi sends ~10.2 KB on the same AP).
+ */
+#define IWX_AMSDU_MAX_BODY	4096
+#define IWX_AMSDU_MAX_SUBF	8
+#define IWX_AMSDU_MAP_SIZE	12288
 
 struct iwx_tx_ring {
 	struct iwx_dma_info	desc_dma;
@@ -358,6 +369,7 @@ struct iwx_tx_ring {
 	int			queued;
 	int			cur;
 	int			tail;
+	uint32_t		map_size;	/* smallest TX buffer of the ring's slots (bytes), 0 = not set */
 };
 
 #define IWX_RX_MQ_RING_COUNT	512
@@ -611,7 +623,16 @@ struct iwx_softc {
     struct iwx_ba_task_data    ba_rx;
     struct iwx_ba_task_data    ba_tx;
     
+    /* TX A-MSDU: the firmware's TLC A-MSDU notification (0 = not allowed yet). */
+    uint16_t sc_amsdu_size;
+    uint16_t sc_amsdu_tids;
     struct iwx_tid_data sc_tid_data[IWX_MAX_TID_COUNT + 1];//per tid data + mgmt. Look at %iwx_tid_data.
+    /*
+     * TIDs of IWX_STATION_ID that own a firmware Tx queue added with
+     * SCD_QUEUE_CONFIG_CMD. That API removes queues by (station, TID) and
+     * requires the removal before the station itself is removed.
+     */
+    uint32_t sc_scd_tid_mask;
 
     /* Task for ERP/HT prot/slot-time/EDCA updates. */
     struct task        mac_ctxt_task;
@@ -687,6 +708,12 @@ struct iwx_softc {
 
 	int sc_intmask;
 	int sc_flags;
+	/* A scan was aborted; its completion must not end the next scan. */
+	bool sc_scan_abort_pending;
+	/* 1 once the aborted scan's completion notification has arrived. */
+	int sc_scan_abort_done;
+	/* How long to wait for ALIVE, in ms (0 = the default 1000 ms). */
+	uint32_t sc_alive_timeout;
 
 	uint32_t sc_fh_init_mask;
 	uint32_t sc_hw_init_mask;

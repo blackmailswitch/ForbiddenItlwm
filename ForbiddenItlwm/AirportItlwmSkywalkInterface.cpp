@@ -1003,7 +1003,19 @@ setASSOCIATE(struct apple80211_assoc_data *ad)
         memcpy(rsn_ie_data.ie, ad->ad_rsn_ie, rsn_ie_data.len);
         setRSN_IE(&rsn_ie_data);
 
-        return associateSSID(ad->ad_ssid, ad->ad_ssid_len, ad->ad_bssid, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_key.key, ad->ad_key.key_len, ad->ad_key.key_index);
+        IOReturn assocRet = associateSSID(ad->ad_ssid, ad->ad_ssid_len, ad->ad_bssid, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_key.key, ad->ad_key.key_len, ad->ad_key.key_index);
+        /*
+         * net80211 joins at the end of the scan in progress, up to a full
+         * scan (3-4 s) later, which can exceed the system's ~4 s association
+         * timeout. Ask the driver to end the scan now and choose the BSS
+         * from the node table filled by the scan that preceded this request.
+         */
+        if (assocRet == kIOReturnSuccess && ic->ic_state == IEEE80211_S_SCAN &&
+            ic->ic_scan_restart_supported) {
+            ic->ic_join_now = true;
+            ic->ic_newstate(ic, IEEE80211_S_SCAN, -1);
+        }
+        return assocRet;
     }
     return kIOReturnSuccess;
 }

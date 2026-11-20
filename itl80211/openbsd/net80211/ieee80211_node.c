@@ -1469,6 +1469,15 @@ ieee80211_end_scan(struct _ifnet *ifp)
 #endif
         if (ic->ic_state != IEEE80211_S_RUN) {
             /*
+             * A one-channel join scan (ic_join_chan) can miss the BSS, with
+             * or without hearing other networks; look at that channel once
+             * more before scanning all channels.
+             */
+            if (ic->ic_join_chan_scanned && ic->ic_join_chan_retries < 1) {
+                ic->ic_join_chan_retries++;
+                ic->ic_join_chan = ic->ic_join_chan_scanned;
+            }
+            /*
              * Reset the list of channels to scan and scan the next mode
              * if nothing has been found.
              * If the device scans all bands in one fell swoop, return
@@ -1570,8 +1579,10 @@ ieee80211_end_scan(struct _ifnet *ifp)
         ic->ic_bss->ni_unref_cb = ieee80211_node_switch_bss;
         /* F_BGSCAN flag gets cleared in ieee80211_node_join_bss(). */
         return;
-    } else if (selbs == NULL)
+    } else if (selbs == NULL) {
         goto notfound;
+    }
+    ic->ic_join_chan_scanned = 0;
     
     ieee80211_node_join_bss(ic, selbs);
 }
@@ -2521,6 +2532,7 @@ ieee80211_setup_vhtcaps(struct ieee80211com *ic, struct ieee80211_node *ni, cons
         return;
     /* vht capability */
     peer_vhtcap = le32dec(ie + 2);
+    ni->ni_vht_peer_max_mpdu = peer_vhtcap & IEEE80211_VHTCAP_MAX_MPDU_MASK;
     /* suppmcs */
     rx_mcs_map = le16dec(ie + 6);
     rx_highest = le16dec(ie + 8);
@@ -2796,6 +2808,7 @@ void
 ieee80211_clear_vhtcaps(struct ieee80211_node *ni)
 {
     ni->ni_vhtcaps = 0;
+    ni->ni_vht_peer_max_mpdu = 0;
     memset(&ni->ni_vht_mcsinfo, 0, sizeof(ni->ni_vht_mcsinfo));
     
     ni->ni_flags &= ~(IEEE80211_NODE_VHT | IEEE80211_NODE_VHT_SGI80 |
@@ -3017,7 +3030,8 @@ ieee80211_node_join_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     ni->ni_key_count = 0;
     ni->ni_port_valid = 0;
-    ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+    ni->ni_flags &= ~(IEEE80211_NODE_TXRXPROT |
+        IEEE80211_NODE_TXRXMGMTPROT);
     ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
     ni->ni_replaycnt = -1;	/* XXX */
     ni->ni_rsn_retries = 0;
@@ -3258,7 +3272,8 @@ ieee80211_node_leave_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)
     timeout_del(&ni->ni_sa_query_to);
     
     ni->ni_rsn_retries = 0;
-    ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+    ni->ni_flags &= ~(IEEE80211_NODE_TXRXPROT |
+        IEEE80211_NODE_TXRXMGMTPROT);
     ni->ni_port_valid = 0;
     (*ic->ic_delete_key)(ic, ni, &ni->ni_pairwise_key);
 }
