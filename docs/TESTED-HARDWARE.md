@@ -95,11 +95,13 @@ Users on Reddit and GitHub have reported:
 | Intel AX210 (Lenovo ThinkPad E14 Gen 5, AMD) | macOS 26.7.3, with 0.5.3-test1: the driver runs and the checks pass; AirDrop untested, no Apple device at hand (issue #43) |
 | Intel AX210 | macOS 26.7.2, with 0.5.4-beta.2: AirDrop works both ways; Sidecar and Universal Control fail (issue #56, same cause as #42) |
 | Intel AX200 (MacBookPro16,4 SMBIOS) | macOS 26.7.2, with BTLEAdvFixup 0.9.1: a new Bluetooth LE mouse pairs and stays connected (PR #31) |
-| Intel AX210 (discrete, VT-d) | macOS 26.7.3: two nights of scheduled sleep with the full AirDrop flag set, no sleep or wake failures, Wi-Fi rejoins 6 s after wake (issue #38) |
+| Intel AX210 (discrete, VT-d) | macOS 26.7.3: five nights of scheduled sleep with the full AirDrop flag set. Four woke normally, with Wi-Fi rejoining 6–10 s after the wake; on one the driver stayed unavailable until Wi-Fi was turned off and on (issue #38, open) |
+| Intel AX200 | macOS 26.7.3, with a local build of 0.6.0-beta.1: AirDrop with a MacBook Air M1 works both ways, listener on 44 at 20 MHz, the hackintosh's Wi-Fi on 36 at 80 MHz ([PR #74](https://github.com/retropineaple/ForbiddenItlwm/pull/74)) |
 | Intel AX211 | macOS 26.7.3, with the same-channel fix (PR #47): Mac → iPhone 27–33 MB/s instead of 3–4 MB/s (PR #47) |
 | Intel AX210 (desktop, Intel NUC8i7HVK) | macOS 26.7.3, with the same-channel fix (PR #47): 19–26 MiB/s with the iPhone's network on 149 (issue #24) |
 | Intel AX201 | macOS 26.7.3, with 0.6.0-alpha.1 in Japan: listener on channel 44 at 80 MHz, Mac → iPhone 26 MB/s, iPhone → Mac 27.6 MB/s (issues #17, #21) |
 | Intel AX201 (Lenovo AIO, Tiger Lake) | macOS Sequoia 15.8.2, with 0.6.0-alpha.1 in China: iPhone → Mac about 40 MB/s, Mac → iPhone 27–31 MB/s, block ack agreed (issue #24). With 0.5.4-beta.2: Handoff works, but its badge shows an old device name; Instant Hotspot doesn't (issue #40) |
+| Intel AX201 | macOS Sequoia 15.8.1, with 0.6.0-alpha.1, Mac's Wi-Fi and the listener both on 149: Mac → iPhone 28–30 MB/s, iPhone → Mac 36 MB/s, block ack agreed (issue #24) |
 | Intel AX211 (Dell XPS) | macOS 26.7.3, with 0.6.0-alpha.1 in the UK, router on 44: iPhone → Mac works on 44 (it didn't on 0.5.4); Mac → iPhone stalls (issues #17, #63, open) |
 | Intel AX201 (CNVi, Alder Lake or newer) | macOS 26.7.3: AirDrop with an iPad works both ways; with 0.6.0-alpha.1 and an iPhone 17 Pro it fails (issue #45, open) |
 | Intel AX210 | Sonoma 14.8.9, with 0.5.4-beta.2: the listener starts, but `awdl0` isn't created (issue #55, open) |
@@ -115,5 +117,5 @@ The project hasn't verified these reports. The platforms, and which features wer
 - Other macOS builds, and 26.7.2 and 26.7.3 on the project's own hackintosh
 - **macOS Sequoia on the project's own hackintosh.** The Sequoia build was verified offline from the 15.8 and 15.8.3 Kernel Debug Kits, and in the user reports so far (above) Wi-Fi works. With 0.5.1-test1 users report AirDrop working both ways on 15.8.2 (#7) and 15.6 (#19), and with 0.6.0-alpha.1 on 15.8.2 at up to 40 MB/s (#24)
 - **macOS Sonoma (test build).** Verified offline from the 14.8.9 Kernel Debug Kit. One user booted it (#55): Wi-Fi and the listener start, AirDrop doesn't yet
-- iPads, other iPhones, other Macs (users report iPads working, #29 and #45, and AirPlay to a Mac mini, #42; AirDrop with a Mac as the other device isn't confirmed, #33)
-- Sleep and wake (one user report without problems: #38), sleep during a transfer, and long-term stability
+- iPads, other iPhones, other Macs (users report iPads working, #29 and #45, and AirPlay to a Mac mini, #42; AirDrop with a Mac as the other device is reported working by two users, one on a local build of 0.6.0-beta.1 (PR #74) and one on a modified build (PR #44), #33)
+- Sleep and wake (one user report: four of five nights fine, #38), sleep during a transfer, and long-term stability
