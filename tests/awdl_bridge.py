@@ -11,12 +11,20 @@ body=source[start:source.index('\n#if defined(ITL_AWDL_NATIVE)',start+100)]
 program=r'''
 #include <AWDLLocalSchedule.hpp>
 #include <AWDLPeerProbe.hpp>
+#include <AWDLElection.hpp>
 #include <cassert>
 #include <cstring>
 #include <cstdio>
 static unsigned itlAWDLFixedChannel() { return 6; }
 static unsigned itlAWDLChannelClass() { return 0; }
 static bool itlAWDLTwoStreams() { return false; }
+static bool itlAWDLExecPlan(uint8_t *) { return false; }   // off, as without -itlschedadvertise
+static bool itlAWDLClockState(ItlAWDL::ElectionAdvert *, ItlAWDL::Clock *) { return false; }   // off
+static volatile uint32_t itlAWDLSelfMetric, itlAWDLSelfCounter, itlAWDLSelfKnown;
+static volatile uint32_t itlAWDLSelfElectionId, itlAWDLSelfElectionIdKnown;
+static void itlSvcNoteMiBuilt() {}
+static volatile uint32_t itlAWDLUmiPending, itlAWDLUmiGo;
+static volatile int itlAWDLForceMI, itlAWDLLastBuildMI;
 using IOReturn=unsigned;
 enum { kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNotReady=2,
        kIOReturnNoMemory=3,kIOReturnUnsupported=4,kIOReturnError=5,MBUF_DONTWAIT=0 };
@@ -45,6 +53,8 @@ struct ItlAWDLInterface {
     unsigned references=0; bool ready=true,malformed=false;
     bool copyMasterIndication(uint8_t*,size_t,size_t*) { return false; }
     bool hasMasterIndication() const { return false; }
+    bool takeUnicastMI(uint8_t*,size_t,size_t*,uint8_t*,uint64_t) { return false; }
+    void noteUnicastMISent() {}
     void retain() { ++references; } void release() { assert(references);--references; }
     IOReturn copyFrameConfiguration(FrameConfiguration *p) {
         if(!ready) return kIOReturnNotReady;

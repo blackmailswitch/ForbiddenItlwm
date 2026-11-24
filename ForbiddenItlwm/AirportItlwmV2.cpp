@@ -17,6 +17,219 @@
 // -itlawdlsamples: raw samples of native requests, templates and packets in the registry. They can hold
 // addresses and service records, and any local user can read the registry, so they are off by default.
 static bool awdlRawSamples;
+
+// read by ItlIwx's follower (-itlschedsp): macOS's requested AWDL channel sequence,
+// the 16 channel numbers from setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE. itlAWDLPlanVersion is odd while the copy
+// is being written and rises by 2 per complete plan, so a reader can tell a torn copy. 0 = no plan yet. Only
+// written when macOS sends 16 entries with step count 3 (one entry per extended AW), the layout the follower
+// assumes.
+uint8_t itlAWDLPlanChannels[16];
+// -itlrxloss or itlawdlsched=3, read per second by ItlIwx.cpp: every way an AWDL data frame handed to awdl0
+// can end, counted (they were silent before, apart from delivered and refused by the queue).
+volatile uint32_t itlAWDLRxParseBad, itlAWDLRxNotOurs, itlAWDLRxSelf, itlAWDLRxAllocFail, itlAWDLRxPrepFail,
+    itlAWDLRxCopyFail, itlAWDLRxQueueFail, itlAWDLRxDelivered, itlAWDLRxDisabled;
+// Frames whose two per-frame AWDL bytes weren't macOS's defaults (3, 4), and the last such pair. They used to be
+// dropped as unparseable.
+volatile uint32_t itlAWDLRxMetaOther, itlAWDLRxMetaLast;
+// ItlIwx.cpp: itlawdlsched=<bits>; 0x1 scheduler set (experimental, off by default), 0x2 diagnostics.
+extern bool itlResFlag(const char *name, uint32_t bit);
+volatile uint32_t itlAWDLPlanVersion;
+// ItlIwx.cpp -itlschedmacchan: macOS's AWDL secondary master channel (0 = not set yet).
+volatile uint32_t itlAWDLReqSecondaryMaster;
+// -itlawdlumi, ItlIwx.cpp: 1 while a unicast MI from macOS waits to be sent; the peer manager asks for one
+// (sendUnicastMI, from handleUmiTimer) when a peer is waiting for this Mac, e.g. to set up a data path.
+volatile uint32_t itlAWDLUmiPending, itlAWDLUmiGo;
+volatile uint64_t itlAWDLUmiAtUS;
+static bool itlAWDLUmiOn()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        int dummy = 0;
+        cached = PE_parse_boot_argn("-itlawdlumi", &dummy, sizeof(dummy)) ? 1 : 0;
+    }
+    return cached == 1;
+}
+static uint64_t itlAWDLUptimeUS()
+{
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000;
+}
+// read in ItlIwx.cpp: when macOS last changed the content of its master indication (services, host
+// name: every TLV type but the per-frame and schedule ones), and how often. Timing the sync frame template showed it
+// carries no services. Measurement only.
+volatile uint64_t itlAWDLTemplateChangeUS;
+volatile uint32_t itlAWDLTemplateChanges;
+static uint32_t itlAWDLMiContentHash;
+// what macOS's OOB_AUTO_REQUEST asks the firmware for (IO80211AWDLPeerManager::updatePrimaryPayloadMI, 26.7.2):
+// +0x0c a random send offset in us, +0x10 the MI bitmap (default 0xffffffff; 0x05050505 = slots 0, 2, 8, 10, read as one bit
+// per slot over two 16-slot sequences), +0x14 options. itlAWDLForceMI (set by ItlIwx.cpp around a build) makes the next frame
+// an MI; itlAWDLLastBuildMI says whether the last frame built was a broadcast MI.
+volatile uint32_t itlAWDLMiBitmap = 0xffffffffU, itlAWDLMiOffsetUS, itlAWDLMiOptions, itlAWDLMiBitmapChanges;
+volatile int itlAWDLForceMI, itlAWDLLastBuildMI;
+static uint32_t itlAWDLMiContentHashOf(const uint8_t *tlvs, size_t length)
+{
+    // Types 4, 5, 12, 18, 20, 21 and 24 (sync, election, data path, channel sequence, sync tree, version) change every frame
+    // or with the schedule (as the service-timing tracker); everything else is content.
+    const uint32_t volatileTypes = (1u << 4) | (1u << 5) | (1u << 12) | (1u << 18) | (1u << 20) | (1u << 21) | (1u << 24);
+    uint32_t h = 2166136261U;
+    for (size_t i = 0; i + 3 <= length;) {
+        const size_t n = size_t(tlvs[i + 1]) | size_t(tlvs[i + 2]) << 8;
+        if (i + 3 + n > length)
+            break;
+        if (!(volatileTypes & (1u << (tlvs[i] & 31))))
+            for (size_t k = 0; k < 3 + n; ++k)
+                h = (h ^ tlvs[i + k]) * 16777619U;
+        i += 3 + n;
+    }
+    return h;
+}
+// ItlIwx.cpp: the 16 channels the radio really follows, while the macOS-plan follower runs with
+// -itlschedadvertise; false otherwise, and our frames advertise the fixed channel as before.
+extern bool itlAWDLExecPlan(uint8_t *out);
+// ItlIwx.cpp: our own election metric and counter, as macOS put them in the template's election v2
+// TLV, for the driver's election; and the election result and clock our frames should advertise.
+volatile uint32_t itlAWDLSelfMetric, itlAWDLSelfCounter, itlAWDLSelfKnown;
+// our election ID (from macOS's template) and the election RSSI threshold macOS sends the chip.
+volatile uint32_t itlAWDLSelfElectionId, itlAWDLSelfElectionIdKnown;
+volatile int32_t itlAWDLElectionRssiFromMacOS;   // 0 = not sent yet
+// -itlsvctiming, read with -itllog from the ITLAWDLLog ring: IOLog lines from this kext don't reach
+// macOS's log, In testing, service-discovery timing ("ITLSVC ..." with uptime in ms). Logs which TLV types of
+// macOS's master-indication template changed (not their contents), when the first MI frame carrying the change was
+// built, and (ItlIwx.cpp) when a peer's service response not seen in the last 10 s arrived. Nothing else changes.
+volatile uint32_t itlSvcUpdates;            // template updates that changed a non-timing TLV
+volatile uint64_t itlSvcLastUpdateUS;
+static int itlSvcTimingState;               // 0 not read, 1 off, 2 on
+static bool itlSvcTxPending;
+static uint32_t itlSvcTypeHash[32];
+static uint64_t itlSvcNowUS()
+{
+    uint64_t uptime, ns;
+    clock_get_uptime(&uptime);
+    absolutetime_to_nanoseconds(uptime, &ns);
+    return ns / 1000;
+}
+bool itlSvcTimingOn()
+{
+    if (!itlSvcTimingState) {
+        int dummy = 0;
+        itlSvcTimingState = PE_parse_boot_argn("-itlsvctiming", &dummy, sizeof(dummy)) ? 2 : 1;
+    }
+    return itlSvcTimingState == 2;
+}
+// A new template: per TLV type, a hash of its values; types 4, 5, 12, 18, 20, 21 and 24 (sync, election, data
+// path, channel sequence, sync tree, version) change every frame or with the schedule and don't count.
+static void itlSvcNoteTemplate(const uint8_t *tlvs, size_t length)
+{
+    if (!itlSvcTimingOn() || !tlvs)
+        return;
+    uint32_t hash[32] = {};
+    uint32_t present = 0;
+    for (size_t i = 0; i + 3 <= length;) {
+        const size_t n = size_t(tlvs[i + 1]) | size_t(tlvs[i + 2]) << 8;
+        if (i + 3 + n > length)
+            break;
+        const unsigned type = tlvs[i] & 31;
+        uint32_t h = hash[type] ? hash[type] : 2166136261u;
+        for (size_t k = 0; k < n; ++k)
+            h = (h ^ tlvs[i + 3 + k]) * 16777619u;
+        hash[type] = h ? h : 1;
+        present |= 1u << type;
+        i += 3 + n;
+    }
+    const uint32_t volatileTypes = (1u << 4) | (1u << 5) | (1u << 12) | (1u << 18) | (1u << 20) | (1u << 21) |
+                                   (1u << 24);
+    uint32_t changed = 0;
+    for (unsigned t = 0; t < 32; ++t)
+        if (hash[t] != itlSvcTypeHash[t])
+            changed |= 1u << t;
+    memcpy(itlSvcTypeHash, hash, sizeof(hash));
+    changed &= ~volatileTypes;
+    if (!changed)
+        return;
+    const uint64_t now = itlSvcNowUS();
+    const uint32_t number = ++itlSvcUpdates;
+    itlSvcLastUpdateUS = now;
+    itlSvcTxPending = true;
+    XYLog("ITLSVC %llu upd #%u changed types 0x%08x present 0x%08x len %u\n", (unsigned long long)(now / 1000),
+          number, changed, present, unsigned(length));
+}
+// The frame builder made an MI frame (carrying the template's services).
+void itlSvcNoteMiBuilt()
+{
+    if (!itlSvcTimingOn() || !itlSvcTxPending)
+        return;
+    itlSvcTxPending = false;
+    const uint64_t now = itlSvcNowUS();
+    XYLog("ITLSVC %llu tx #%u first MI frame +%llu ms after the update\n", (unsigned long long)(now / 1000),
+          itlSvcUpdates, (unsigned long long)((now - itlSvcLastUpdateUS) / 1000));
+}
+// ItlIwx.cpp, -itlschedawdloff: macOS's last setAWDL_SYNC_ENABLED, 1 on, 0 off (also before the
+// first request). macOS turns AWDL off when nothing uses it.
+volatile uint32_t itlAWDLSyncOn;
+// -itlinfrastats, off by default: report the station's traffic to IO80211's interface monitor,
+// which macOS's AWDL scheduler reads (IO80211AWDLPeerManager::gatherInfraStats) to tell an idle Wi-Fi from a busy
+// one. The driver never fed it, so macOS always saw 0 packets and planned "Data + Infra Idle" (24% Wi-Fi). Once a
+// second, the deltas of en0's packet and byte counters go to IO80211SkywalkInterface::recordInputPacket and
+// recordOutputPacket (best effort), the calls that increment those reporters. Both symbols are exported by
+// IO80211Family on every target (26.7.x, 15.8.x, 14.x) and are called directly, not through the vtable.
+extern IOReturn itlRecordInputPacket(IO80211SkywalkInterface *, int, int)
+    __asm__("__ZN23IO80211SkywalkInterface17recordInputPacketEii");
+extern IOReturn itlRecordOutputPacket(IO80211SkywalkInterface *, int, int, int)
+    __asm__("__ZN23IO80211SkywalkInterface18recordOutputPacketE17apple80211_wme_acii");
+static int itlInfraStatsState;   // 0 not read yet, 1 off, 2 on
+static bool itlInfraStatsPrimed;
+static uint64_t itlInfraLastPkIn, itlInfraLastByIn, itlInfraLastPkOut, itlInfraLastByOut;
+static uint64_t itlInfraSumPkIn, itlInfraSumByIn, itlInfraSumPkOut, itlInfraSumByOut;
+// unicast only. Testing showed broadcast and multicast too (about 180 packets/s at idle on a busy network),
+// which put macOS in "Infra Priority" for good (threshold 50 per check). multicasts_in/_out count broadcast and
+// multicast; bytes are scaled by the unicast share of packets.
+static uint64_t itlInfraLastMcIn, itlInfraLastMcOut, itlInfraSumMcIn, itlInfraSumMcOut;
+static uint32_t itlInfraTicks, itlInfraStatFails;
+// -itlawstart, ItlIwx.cpp builds the payload: a timer on the watchdog's work loop posts
+// APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START on the AWDL interface at each extended AW of the follower's clock.
+extern bool itlAWDLAwStart(uint8_t *out36, uint64_t *nextInUS);
+extern bool itlAWDLAwEnd(uint8_t *out, size_t length);
+static int itlAwStartState;   // 0 not read yet, 1 off, 2 on
+static IOTimerEventSource *itlAwStartTimer;
+static uint32_t itlAwStartPosted, itlAwStartIdle, itlAwStartWatch;
+// -itlawdlstats: AWDL RX counts for macOS. IO80211's AWDL data-mode monitor
+// (IO80211AWDLPeerManager::monitorAWDLDataMode) reads RX and TX packet counters in the AWDL peer manager's state.
+// Both our AWDL RX (bypasses IO80211PeerManager::inputPacket) and our injected TX (bypasses preQueuePacket /
+// getUnicastPackets) skip IO80211's peer-manager data path, so macOS saw ~0 AirDrop packets. macOS's log proved
+// it: monitorAWDLDataMode saw Rx~1000/AW but Tx 0 (the earlier "TX counted natively" note was wrong). Setting the
+// counters with IO80211SkywalkInterface::updateInterfaceDataStats, but that overwrites ~30 fields of the live
+// accounting with our values and zeros made Mac -> iPhone sends stall, so this instead adds our RX and TX deltas to
+// the two packet counters, as inputPacket / preQueuePacket's `incl` would: interface +0x120 -> +0x28 = AWDL peer
+// manager, +0x18 = its state; RX at +0x79c, TX at +0x7b0 on 26.7.x (Tahoe); RX +0x78c, TX +0x7a0 on 15.8.x
+// (Sequoia). From the disassembly of updateInterfaceDataStats, updateLocalCounters, inputPacket and preQueuePacket.
+// Supported-builds audit (2026-11-23): the interface -> peer manager step is IO80211SkywalkInterface::getPeerManager(),
+// now called directly (it differs per macOS: +0x120 -> +0x28 on Tahoe (26.7.2/26.7.3), +0x110 -> +0x28 on Sequoia (15.8/15.8.3),
+// +0x110 -> +0x30 on Sonoma 14.8.9). Before, Tahoe's +0x120 was used everywhere, a wrong pointer on Sequoia. The state
+// is the peer manager's +0x18 everywhere; RX/TX from IO80211PeerManager::inputPacket / preQueuePacket per build.
+extern bool itlAWDLDataCounts(uint32_t *rxPkts, uint32_t *txPkts);
+extern bool itlAWDLBuildVerified();
+extern bool itlAWDLBuildForced();
+// IO80211SkywalkInterface::getPeerManager() (exported, non-virtual; on Tahoe "mov 0x120(%rdi),%rax; mov 0x28(%rax),%rax")
+// and IO80211AWDLPeerManager's vtable (exported on every build checked, 14.8.3 to 26.7.3). The counters write only
+// when the returned object's vtable is that one, so a moved layout on an unverified build turns them off instead.
+extern "C" void *itlSkywalkGetPeerManager(void *interface) __asm__("__ZN23IO80211SkywalkInterface14getPeerManagerEv");
+extern const uintptr_t itlNativeAWDLPeerManagerVtable[] __asm__("__ZTV22IO80211AWDLPeerManager");
+#if __IO80211_TARGET == __MAC_26_0
+static constexpr size_t kItlAwdlPmRxOff = 0x79c, kItlAwdlPmTxOff = 0x7b0;
+#elif __IO80211_TARGET == __MAC_15_2
+static constexpr size_t kItlAwdlPmRxOff = 0x78c, kItlAwdlPmTxOff = 0x7a0;
+#elif __IO80211_TARGET == __MAC_14_4
+static constexpr size_t kItlAwdlPmRxOff = 0x77c, kItlAwdlPmTxOff = 0x790;
+#else
+static constexpr size_t kItlAwdlPmRxOff = 0, kItlAwdlPmTxOff = 0;
+#endif
+static int itlAwdlStatsState;   // 0 not read yet, 1 off, 2 on
+static uint32_t itlAwdlStatsCalls, itlAwdlStatsLastRx, itlAwdlStatsAdded, itlAwdlStatsNoPath, itlAwdlStatsWrongPm;
+static uint32_t itlAwdlStatsLastTx, itlAwdlStatsAddedTx;
+static bool itlAwdlStatsPrimed;
+static void itlReportAWDLData(AirportItlwm *self);
+static void itlAwStartFire(OSObject *owner, IOTimerEventSource *sender);
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <AWDLObservation.hpp>
 #include <sys/_netstat.h>
@@ -29,9 +242,15 @@ static bool awdlRawSamples;
 #if defined(ITL_AWDL_NATIVE)
 #include "AirportAWDLInterface.hpp"
 #include <Airport/IO80211ManagementBuffer.h>
+// The tested set, on by default from 0.7.0-alpha.2 (AWDLBuildGuard.cpp).
+extern bool itlAWDLFlag(const char *name);
+extern bool itlAWDLDefaults();
 #include <AWDLManagementFrame.hpp>
 #include <AWDLLocalSchedule.hpp>
 #include <AWDLPeerProbe.hpp>
+#include <AWDLElection.hpp>
+// ItlIwx.cpp: the election result and clock our frames advertise; false when off.
+extern bool itlAWDLClockState(ItlAWDL::ElectionAdvert *advert, ItlAWDL::Clock *clock);
 #include <AWDLDataPayload.hpp>
 #include <AWDLDataFrame.hpp>
 #include <Airport/IOSkywalkPacketView.h>
@@ -76,12 +295,68 @@ IOReturn ItlAWDLInterface::setAWDL_ELECTION_PARAMS(apple80211_awdl_election_para
     return data ? kIOReturnSuccess : kIOReturnBadArgument;
 }
 
+// IO80211's determineAndSetEdgeRssiThreshold (26.7.2) sends this with the threshold at +0x10 of a
+// 20-byte buffer (our header's struct stops at 16): -70 dBm normally, -78 with single-stream/AirPlay services.
+IOReturn ItlAWDLInterface::setAWDL_ELECTION_RSSI_THRESHOLDS(apple80211_awdl_election_rssi_thresholds *data)
+{
+    const IOReturn result = storeRequested(requested_AWDL_ELECTION_RSSI_THRESHOLDS, data, "AWDL_ELECTION_RSSI_THRESHOLDS");
+    if (result == kIOReturnSuccess && data) {
+        int32_t threshold;
+        memcpy(&threshold, reinterpret_cast<const uint8_t *>(data) + 0x10, sizeof(threshold));
+        if (threshold >= -100 && threshold <= -30) {
+            itlAWDLElectionRssiFromMacOS = threshold;
+            setProperty("ItlwmAWDLElectionRssiThreshold", uint64_t(uint32_t(threshold)), 32);
+        }
+    }
+    return result;
+}
+
 IOReturn ItlAWDLInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration *data)
 {
     if (!nativeState.accept)
         return unsupported("setAWDL_PEER_TRAFFIC_REGISTRATION");
     // Acknowledged only. Its embedded pointer is neither read nor kept.
     return data ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+// -itlpeercache: . IO80211 asks the driver to keep an AWDL peer in the "firmware
+// peer cache" through APPLE80211_IOC_PEER_CACHE_CONTROL (IO80211P2PDataPathManager::
+// sendIoctlToCachePeer, decoded from 26.7.2). On success IO80211 itself counts the peer as
+// cached (_currentPeerCacheSize, the "CPC"/"Cached peer count" in its log) for an add; with
+// the old "unsupported" answer the count stays 0 and the AWDL schedule keeps choosing the
+// No-Cached-Peers states. The request is a 464-byte buffer IO80211 allocates: version at +0,
+// opcode at +4 (0 add, 2 delete; 1 and 3 are firmware indications going the other way),
+// peer address at +8. Intel firmware has no such cache, so the driver only acknowledges.
+// Known gap: IO80211 lowers the count only on the firmware's delete indication, which can't
+// be delivered on awdl0 (the AWDL peer manager handles that event number itself), so the count
+// can rise to IO80211's cap (8) but not fall.
+IOReturn ItlAWDLInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_control *data)
+{
+    if (!nativeState.accept || !peerCacheAccept) {
+        peerCacheRefused++;
+        return unsupported("setPEER_CACHE_CONTROL");
+    }
+    if (!data)
+        return kIOReturnBadArgument;
+    const uint8_t *raw = reinterpret_cast<const uint8_t *>(data);
+    uint32_t version, opcode;
+    memcpy(&version, raw, sizeof(version));
+    memcpy(&opcode, raw + 4, sizeof(opcode));
+    IOReturn result = kIOReturnSuccess;
+    if (opcode == 0)
+        peerCacheAdds++;
+    else if (opcode == 2)
+        peerCacheDeletes++;
+    else {
+        peerCacheOther++;
+        result = kIOReturnUnsupported;
+    }
+    char text[160];
+    // Only the last two address bytes are shown.
+    snprintf(text, sizeof(text), "adds %u deletes %u other %u refused %u; last op %u ver %u peer ..:%02x:%02x",
+             peerCacheAdds, peerCacheDeletes, peerCacheOther, peerCacheRefused, opcode, version, raw[12], raw[13]);
+    setProperty("ITLAWDLPeerCache", text);
+    return result;
 }
 
 extern bool itlAWDLBuildVerified();
@@ -91,19 +366,39 @@ void ItlAWDLInterface::acceptNativeRequests()
 {
     nativeState.accept = true;
     setProperty("ItlwmAWDLNativeUp", true);
-    int debug = 0;
-    debugFlagsWanted = PE_parse_boot_argn("-itlawdlpmdebug", &debug, sizeof(debug));
+    debugFlagsWanted = itlResFlag("-itlawdlpmdebug", 0x2);
+    peerCacheAccept = itlResFlag("-itlpeercache", 0x1);
+    setProperty("ITLAWDLPeerCache", peerCacheAccept ? "on, no requests yet" : "off");
     // The request carries a raw pointer at a fixed offset, a layout checked only for the verified
-    // builds. On an "expected" build the copy stays off. With -itlawdlanybuild it's on too, so an unverified
-    // build can be tested with AirDrop working (other devices list the Mac only with it): the pointer is then
-    // still range-checked and the copy validated (storeMasterIndication), but the layout isn't known to match.
-    const bool wanted = PE_parse_boot_argn("-itlawdlmitx", &debug, sizeof(debug));
+    // builds. On any other build the copy is off, unless -itlawdlanybuild is set (itlAWDLBuildForced): then an
+    // unverified build works like a verified one (other devices list the Mac only with it), with the pointer still
+    // range-checked and the copy validated (storeMasterIndication), but the layout not known to match.
+    const bool wanted = itlAWDLFlag("-itlawdlmitx");
     const bool verified = itlAWDLBuildVerified();
     const bool forced = !verified && itlAWDLBuildForced();
     masterIndicationEnabled = wanted && (verified || forced);
     setProperty("ItlwmAWDLMiState", !wanted ? "off" : !masterIndicationEnabled ? "blocked: build not verified" :
                 forced ? "on (unverified build, -itlawdlanybuild)" : "on");
 }
+
+#if __IO80211_TARGET != __MAC_14_4   // not a virtual on Sonoma
+// wifip2pd sets a new, random address on awdl0 (it logged "Can't assign requested address" while this
+// was refused, #85). The address is ours to use: the announcement, data frames and receive filtering
+// all read localFrameAddress, and the firmware listener follows the address of the sync frames macOS
+// builds, changing its own before it sends anything. Nothing is published but the count.
+// From ann0see's diff in #85.
+IOReturn ItlAWDLInterface::setMacAddress(ether_addr &address)
+{
+    IOLock *lock = ensureConfigurationLock();
+    if (!lock)
+        return kIOReturnNoMemory;
+    IOLockLock(lock);
+    memcpy(localFrameAddress, &address, sizeof(localFrameAddress));
+    IOLockUnlock(lock);
+    setProperty("ItlwmAWDLAddressSetCalls", ++addressSetCalls, 32);
+    return kIOReturnSuccess;
+}
+#endif
 
 IOReturn ItlAWDLInterface::getAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode *data)
 {
@@ -157,14 +452,128 @@ IOReturn ItlAWDLInterface::noteOobRequest(const apple80211_awdl_oob_request *dat
 
 IOReturn ItlAWDLInterface::setAWDL_OOB_REQUEST(apple80211_awdl_oob_request *data)
 {
-    return noteOobRequest(data, "setAWDL_OOB_REQUEST");
+    const IOReturn result = noteOobRequest(data, "setAWDL_OOB_REQUEST");
+    if (result == kIOReturnSuccess && itlAWDLUmiOn())
+        storeUnicastMI(data);
+    return result;
+}
+
+// . IO80211AWDLPeerManager::sendUnicastMI (26.7.2) fills the request: +0x04 the peer's address (6 bytes),
+// +0x14 options (u16: 6, or 0xe for a peer "UMIOnDwell"), +0x16 u32 and +0x1a u16 from the peer manager, +0x28 the
+// body's length (u16), +0x30 a pointer to the body, built by buildMasterIndicationTemplate(unicast) into the peer
+// manager's own buffer (max 0x4b0): the same TLV layout as the AUTO request's MI template. Copied at once, checked
+// like the MI template, and sent once by the sync builder to that peer.
+void ItlAWDLInterface::storeUnicastMI(const apple80211_awdl_oob_request *data)
+{
+    const auto *raw = reinterpret_cast<const uint8_t *>(data);
+    uint16_t length, options;
+    const uint8_t *source;
+    uint8_t peer[6];
+    memcpy(peer, raw + 0x04, sizeof(peer));
+    memcpy(&options, raw + 0x14, sizeof(options));
+    memcpy(&length, raw + 0x28, sizeof(length));
+    memcpy(&source, raw + 0x30, sizeof(source));
+    ++umiRequests;
+    const bool groupPeer = peer[0] & 1;
+    if (reinterpret_cast<uintptr_t>(source) < 0xffffff8000000000ULL || !length || length > sizeof(umiBody) ||
+        groupPeer || !ensureConfigurationLock()) {
+        ++umiRejected;
+        setProperty("ItlwmAWDLUmiRejected", umiRejected, 32);
+        return;
+    }
+    auto *local = static_cast<uint8_t *>(IOMalloc(length));
+    if (!local)
+        return;
+    memcpy(local, source, length);
+    if (!ItlAWDL::masterIndicationWellFormed(local, length)) {
+        IOFree(local, length);
+        ++umiRejected;
+        setProperty("ItlwmAWDLUmiRejected", umiRejected, 32);
+        return;
+    }
+    if (options & 8)
+        ++umiOnDwell;
+    IOLockLock(configurationLock);
+    if (umiLength)
+        ++umiReplaced;
+    memcpy(umiBody, local, length);
+    umiLength = length;
+    memcpy(umiPeer, peer, sizeof(umiPeer));
+    umiAtUS = itlAWDLUptimeUS();
+    itlAWDLUmiAtUS = umiAtUS;
+    IOLockUnlock(configurationLock);
+    IOFree(local, length);
+    __atomic_store_n(&itlAWDLUmiPending, 1U, __ATOMIC_SEQ_CST);
+}
+
+bool ItlAWDLInterface::takeUnicastMI(uint8_t *output, size_t capacity, size_t *written, uint8_t peer[6], uint64_t nowUS)
+{
+    if (!configurationLock || !output || !written || !peer)
+        return false;
+    auto *mi = static_cast<uint8_t *>(IOMalloc(sizeof(umiBody)));
+    if (!mi)
+        return false;
+    IOLockLock(configurationLock);
+    const size_t length = umiLength;
+    const uint64_t atUS = umiAtUS;
+    if (length) {
+        memcpy(mi, umiBody, length);
+        memcpy(peer, umiPeer, 6);
+    }
+    umiLength = 0;
+    IOLockUnlock(configurationLock);
+    __atomic_store_n(&itlAWDLUmiPending, 0U, __ATOMIC_SEQ_CST);
+    bool built = false;
+    // macOS asks inside its AW for the peer it is waiting on; the radio holds one at most 1.1 s for the peer's AW, so
+    // one older than 2.2 s (no frame went out meanwhile) is stale.
+    if (length && nowUS > atUS && nowUS - atUS > 2200000ULL)
+        ++umiStale;
+    else if (length) {
+        built = buildMITLVs(mi, length, output, capacity, written);
+        if (!built)
+            ++umiBuildFailed;
+    }
+    IOFree(mi, sizeof(umiBody));
+    publishUnicastMI();
+    return built;
+}
+
+void ItlAWDLInterface::noteUnicastMISent()
+{
+    ++umiSent;
+    publishUnicastMI();
+}
+
+void ItlAWDLInterface::publishUnicastMI()
+{
+    char text[160];
+    snprintf(text, sizeof(text), "requests %u rejected %u replaced %u sent %u stale %u build-failed %u on-dwell %u",
+             umiRequests, umiRejected, umiReplaced, umiSent, umiStale, umiBuildFailed, umiOnDwell);
+    setProperty("ItlwmAWDLUmi", text);
 }
 
 IOReturn ItlAWDLInterface::setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request *data)
 {
     const IOReturn result = noteOobRequest(data, "setAWDL_OOB_AUTO_REQUEST");
-    if (result == kIOReturnSuccess && masterIndicationEnabled)
+    if (result == kIOReturnSuccess && masterIndicationEnabled) {
+        // the slots and offset macOS asks for, read from the request itself (layout as for the MI pointer).
+        const auto *raw = reinterpret_cast<const uint8_t *>(data);
+        uint32_t offset, bitmap;
+        uint16_t options;
+        memcpy(&offset, raw + 0x0c, sizeof(offset));
+        memcpy(&bitmap, raw + 0x10, sizeof(bitmap));
+        memcpy(&options, raw + 0x14, sizeof(options));
+        if (bitmap != itlAWDLMiBitmap)
+            ++itlAWDLMiBitmapChanges;
+        itlAWDLMiBitmap = bitmap;
+        itlAWDLMiOffsetUS = offset;
+        itlAWDLMiOptions = options;
+        char text[96];
+        snprintf(text, sizeof(text), "bitmap 0x%08x offset %u us options 0x%x changes %u", bitmap, offset, options,
+                 itlAWDLMiBitmapChanges);
+        setProperty("ItlwmAWDLMiRequest", text);
         storeMasterIndication(data);
+    }
     return result;
 }
 
@@ -200,6 +609,15 @@ void ItlAWDLInterface::storeMasterIndication(const apple80211_awdl_oob_request *
     masterIndicationLength = length;
     IOLockUnlock(configurationLock);
     ++masterIndicationUpdates;
+    {   // content changes (services) timed to the first MI out
+        const uint32_t h = itlAWDLMiContentHashOf(local, length);
+        if (h != itlAWDLMiContentHash) {
+            itlAWDLMiContentHash = h;
+            itlAWDLTemplateChangeUS = itlAWDLUptimeUS();
+            ++itlAWDLTemplateChanges;
+        }
+    }
+    itlSvcNoteTemplate(local, length);
     if (masterIndicationUpdates == 1 || !(masterIndicationUpdates % 64))
         setProperty("ItlwmAWDLMiUpdates", masterIndicationUpdates, 32);
     setProperty("ItlwmAWDLMiLength", length, 32);
@@ -218,16 +636,28 @@ extern unsigned itlAWDLFixedChannel();
 extern unsigned itlAWDLChannelClass();
 extern bool itlAWDLBuildAllowed();
 extern const char *itlAWDLBuildStatus();
+// The card's own spatial streams, from the HAL's MCS set: MCS 8-15 exists only with MIMO enabled and
+// two receive antennas (iwx_setup_ht_rates). 0 until the set is known. A one-antenna card (9461, 9462,
+// AX101; #87) must not tell macOS or peers it has two streams.
+static volatile int gItlAWDLCardStreams = 0;
+int itlAWDLNoteCardStreams(const struct ieee80211com *ic)
+{
+    if (ic && ic->ic_sup_mcs[0])
+        gItlAWDLCardStreams = ic->ic_sup_mcs[1] ? 2 : 1;
+    return gItlAWDLCardStreams;
+}
+
 // With -itlawdlcaps the driver reports two HT streams and VHT to macOS; our TLV 7 says the same.
+// Two streams only while the card isn't known to have one.
 static bool itlAWDLTwoStreams()
 {
     static int cached = -1;
     if (cached < 0) {
         int dummy = 0;
-        cached = itlAWDLBuildAllowed() && PE_parse_boot_argn("-itlawdlcaps", &dummy, sizeof(dummy)) &&
+        cached = itlAWDLBuildAllowed() && itlAWDLFlag("-itlawdlcaps") &&
             !PE_parse_boot_argn("-itlawdlcapshtonly", &dummy, sizeof(dummy)) ? 1 : 0;
     }
-    return cached == 1;
+    return cached == 1 && gItlAWDLCardStreams != 1;
 }
 
 bool ItlAWDLInterface::copyMasterIndication(uint8_t *output, size_t capacity, size_t *written)
@@ -242,17 +672,37 @@ bool ItlAWDLInterface::copyMasterIndication(uint8_t *output, size_t capacity, si
     const size_t miLength = masterIndicationLength;
     memcpy(mi, masterIndication, miLength);
     IOLockUnlock(configurationLock);
+    const bool ok = buildMITLVs(mi, miLength, output, capacity, written);
+    IOFree(mi, sizeof(masterIndication));
+    return ok;
+}
+
+// The MI TLVs for our frames from a template macOS built (its MI, or a unicast MI, -itlawdlumi).
+bool ItlAWDLInterface::buildMITLVs(const uint8_t *mi, size_t miLength, uint8_t *output, size_t capacity, size_t *written)
+{
+    if (!mi || !miLength || !output || !written || !capacity)
+        return false;
     // Built in scratch and copied only on success: a failure partway through must leave the caller's
     // buffer, which holds the ordinary frame's template, exactly as it was.
     auto *scratch = static_cast<uint8_t *>(IOMalloc(capacity));
-    if (!scratch) {
-        IOFree(mi, sizeof(masterIndication));
+    if (!scratch)
         return false;
-    }
     size_t length = 0;
-    const bool built = miLength && ItlAWDL::buildMasterIndicationTLVs(mi, miLength, localFrameAddress,
+    uint8_t execSlots[16];
+    const bool exec = itlAWDLExecPlan(execSlots);
+    ItlAWDL::ElectionAdvert electAdvert{};
+    ItlAWDL::Clock electClock = ItlAWDL::ownClock();
+    const bool elect = itlAWDLClockState(&electAdvert, &electClock);
+    bool built = miLength && ItlAWDL::buildMasterIndicationTLVs(mi, miLength, localFrameAddress,
+                                                          scratch, capacity, &length, uint8_t(itlAWDLFixedChannel()),
+                                                          uint8_t(itlAWDLChannelClass()), itlAWDLTwoStreams(),
+                                                          exec ? execSlots : nullptr, elect ? &electAdvert : nullptr);
+    if (!built && (exec || elect)) {
+        length = 0;
+        built = miLength && ItlAWDL::buildMasterIndicationTLVs(mi, miLength, localFrameAddress,
                                                           scratch, capacity, &length, uint8_t(itlAWDLFixedChannel()),
                                                           uint8_t(itlAWDLChannelClass()), itlAWDLTwoStreams());
+    }
     if (built && length <= capacity) {
         memcpy(output, scratch, length);
         *written = length;
@@ -260,7 +710,6 @@ bool ItlAWDLInterface::copyMasterIndication(uint8_t *output, size_t capacity, si
         setProperty("ItlwmAWDLMiBuildFailed", true);
     }
     IOFree(scratch, capacity);
-    IOFree(mi, sizeof(masterIndication));
     return built && length <= capacity;
 }
 
@@ -273,6 +722,7 @@ IOReturn ItlAWDLInterface::setAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *da
     }
     if (result == kIOReturnSuccess && nativeState.accept) {
         setProperty("ItlwmAWDLSyncEnabledRequested", data->enabled, 32);
+        itlAWDLSyncOn = data->enabled ? 1 : 0;
         // The peer manager exists by now. Reject reasons are behind these flags.
         if (data->enabled && debugFlagsWanted && !debugFlagsSet) {
             debugFlagsSet = true;
@@ -299,7 +749,8 @@ IOReturn ItlAWDLInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state *data)
 // its channel from what it hears instead (#17, #35, #68), so these are published to compare the two:
 // ItlwmAWDLReqSeqHeader (length, encoding, step and duplicate counts, fill channel), ItlwmAWDLReqSeqChannels
 // (each entry's channel number), ItlwmAWDLReqSeqRaw (the whole request),
-// ItlwmAWDLReqMasterChannel and ItlwmAWDLReqSecondaryMasterChannel. Published only: nothing follows them yet.
+// ItlwmAWDLReqMasterChannel and ItlwmAWDLReqSecondaryMasterChannel. With -itlschedmacchan the listener
+// follows the secondary master channel; otherwise they are published only.
 IOReturn ItlAWDLInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple80211_awdl_sync_channel_sequence *data)
 {
     const IOReturn result = storeRequested(requested_AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE, data,
@@ -340,6 +791,13 @@ void ItlAWDLInterface::publishRequestedSequence()
         raw->release();
     }
     setProperty("ItlwmAWDLReqSeqSets", ++requestedSequenceSets, 32);
+    if (entries == 16 && copy.step_count == 3) {   // macOS's plan hand-off
+        ++itlAWDLPlanVersion;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(itlAWDLPlanChannels, channels, 16);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        ++itlAWDLPlanVersion;
+    }
 }
 
 IOReturn ItlAWDLInterface::setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *data)
@@ -358,7 +816,10 @@ IOReturn ItlAWDLInterface::setAWDL_SECONDARY_MASTER_CHANNEL(apple80211_awdl_seco
     apple80211_awdl_secondary_master_channel copy {};
     if (result == kIOReturnSuccess &&
         readRequested(requested_AWDL_SECONDARY_MASTER_CHANNEL, &copy) == kIOReturnSuccess)
+    {
         setProperty("ItlwmAWDLReqSecondaryMasterChannel", copy.secondary_master_channel, 32);
+        itlAWDLReqSecondaryMaster = copy.secondary_master_channel;
+    }
     return result;
 }
 
@@ -373,6 +834,7 @@ IOReturn ItlAWDLInterface::setAWDL_SYNC_FRAME_TEMPLATE(apple80211_awdl_sync_fram
     IOLockLock(configurationLock);
     const IOReturn result = frameTemplate.set(data->payload, data->payload_len);
     IOLockUnlock(configurationLock);
+
     if (result == kIOReturnSuccess) {
         setProperty("ItlwmAWDLTemplateStored", data->payload_len != 0);
         setProperty("ItlwmAWDLLastStoredRequest", "AWDL_SYNC_FRAME_TEMPLATE");
@@ -408,29 +870,52 @@ IOReturn ItlAWDLInterface::copyFrameConfiguration(FrameConfiguration *output)
 void ItlAWDLInterface::observeDataFrame(const uint8_t *frame, size_t length)
 {
     if ((!dataDeliverEnabled && (!dataCopyProbeEnabled || dataCopyAttempts >= 8)) || !nativeStarted || !rxPool ||
-        !queueWorkLoop || !queueWorkLoop->inGate()) return;
+        !queueWorkLoop || !queueWorkLoop->inGate()) {
+        ++itlAWDLRxDisabled;
+        return;
+    }
     ItlAWDL::DataFrameView view;
-    if (ItlAWDL::parseDataFrame(frame, length, true, &view) != ItlAWDL::ParseResult::Valid) return;
+    if (ItlAWDL::parseDataFrame(frame, length, true, &view) != ItlAWDL::ParseResult::Valid) {
+        ++itlAWDLRxParseBad;
+        return;
+    }
     // Copy only multicast or our local AWDL destination; drop self echoes.
-    if ((!(*view.destination & 1) && memcmp(view.destination, localFrameAddress, 6)) ||
-        !memcmp(view.source, localFrameAddress, 6)) return;
+    if (!(*view.destination & 1) && memcmp(view.destination, localFrameAddress, 6)) {
+        ++itlAWDLRxNotOurs;   // e.g. sent to an address macOS rotated away from
+        return;
+    }
+    if (!memcmp(view.source, localFrameAddress, 6)) {
+        ++itlAWDLRxSelf;
+        return;
+    }
+    if (view.ip.minExtension != 3 || view.ip.presence != 4) {
+        ++itlAWDLRxMetaOther;
+        itlAWDLRxMetaLast = uint32_t(view.ip.minExtension) << 8 | view.ip.presence;
+    }
     ++dataCopyAttempts;
     auto *pool = reinterpret_cast<ItlSkywalkPoolView *>(rxPool);
     ItlSkywalkPacketView *packet = nullptr;
     const IOReturn allocated = pool->allocatePacket(1, &packet, 1);
     bool copied = false;
     IOReturn prepared = kIOReturnNotReady, completed = kIOReturnNotReady;
+    if (allocated != kIOReturnSuccess || !packet)
+        ++itlAWDLRxAllocFail;
     if (allocated == kIOReturnSuccess && packet) {
         prepared = packet->prepareWithQueue(packetQueues[2], 0, 0);
         const size_t wanted = 14 + view.ip.length;
-        if (prepared == kIOReturnSuccess && packet->getPacketBufferCount() == 1 &&
-            packet->setDataLength(unsigned(wanted)) == kIOReturnSuccess && packet->getDataLength() == wanted) {
+        const bool ready = prepared == kIOReturnSuccess && packet->getPacketBufferCount() == 1 &&
+            packet->setDataLength(unsigned(wanted)) == kIOReturnSuccess && packet->getDataLength() == wanted;
+        if (!ready)
+            ++itlAWDLRxPrepFail;
+        if (ready) {
             auto *bytes = reinterpret_cast<uint8_t *>(packet->getDataVirtualAddress());
             if (bytes) {
                 size_t written = 0;
                 copied = ItlAWDL::copyDataEthernet(view, bytes, wanted, &written) == ItlAWDL::BuildResult::Ready &&
                     written == wanted && !memcmp(bytes, view.destination, 6) && !memcmp(bytes+6, view.source, 6) &&
                     bytes[12] == 0x86 && bytes[13] == 0xdd && !memcmp(bytes+14, view.ip.bytes, view.ip.length);
+                if (!copied)
+                    ++itlAWDLRxCopyFail;
                 if (copied && dataDeliverEnabled) {
                     // Same framing a software Ethernet driver gives the stack.
                     IOReturn delivered = itlPacketSetHeadroom(packet, 0);
@@ -441,11 +926,13 @@ void ItlAWDLInterface::observeDataFrame(const uint8_t *frame, size_t length)
                     if (delivered == kIOReturnSuccess) {
                         // The queue owns the packet now; don't touch or return it.
                         ++dataDelivered;
+                        ++itlAWDLRxDelivered;
                         if (dataDelivered == 1 || !(dataDelivered % 16))
                             setProperty("ItlwmAWDLDataDelivered", dataDelivered, 32);
                         return;
                     }
                     ++dataDeliverFailed;
+                    ++itlAWDLRxQueueFail;
                     if (dataDeliverFailed == 1 || !(dataDeliverFailed % 32))
                         noteQueueState("ItlwmAWDLQueueStateRefused");
                     setProperty("ItlwmAWDLDataDeliverFailed", dataDeliverFailed, 32);
@@ -586,19 +1073,55 @@ UInt32 ItlAWDLInterface::acceptTransmit(IOSkywalkPacket *const *packets, UInt32 
 bool ItlAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *written,
                                    const uint8_t *holdPayloadFor, bool holdEverySize)
 {
-    ++transmitDepthBins[ItlAWDL::depthBin(transmitQueued)];
+    ++transmitDepthBins[ItlAWDL::depthBin(transmitQueued + parkedQueued)];
+    // The parked frames first, in their order, once their peer is no longer held.
+    while (parkedQueued && !(holdPayloadFor && ItlAWDL::sameAddress(parkedPeer, holdPayloadFor))) {
+        const auto &frame = parkedFrames[parkedHead];
+        const auto result = ItlAWDL::buildDataFrameFromEthernet(frame.bytes, frame.length, localFrameAddress,
+                                                                transmitSequence, output, available, written);
+        parkedHead = (parkedHead + 1) % parkedFrameCount;
+        --parkedQueued;
+        ++transmitPopped;
+        if (result == ItlAWDL::BuildResult::Ready) {
+            ++transmitSequence;
+            return true;
+        }
+        ++transmitDropped;
+    }
     while (transmitQueued) {
         const auto &frame = transmitFrames[transmitHead];
         const auto result = ItlAWDL::buildDataFrameFromEthernet(frame.bytes, frame.length, localFrameAddress,
                                                                 transmitSequence, output, available, written);
-        // Hold what is for the capped peer. Leave the FIFO head and sequence intact. With holdEverySize
-        // (iface160) that is every unicast data frame for it: a short frame let past would overtake the
-        // held packets of the same QUIC connection on the listener's unpaused queue, and QUIC counts
-        // overtaken packets as lost. Without it, only payload-sized frames, as on iface157 to iface159.
-        if (result == ItlAWDL::BuildResult::Ready && holdPayloadFor && (holdEverySize || *written >= 1200) &&
-            output[0] == 0x08 && ItlAWDL::sameAddress(output + 4, holdPayloadFor)) {
+        // Hold what is for the capped peer. With holdEverySize (iface160) that is every unicast data frame for
+        // it: a short frame let past would overtake the held packets of the same QUIC connection on the
+        // listener's unpaused queue, and QUIC counts overtaken packets as lost. Without it, only payload-sized
+        // frames, as on iface157 to iface159. Held frames are parked, in order, so the frames behind them for
+        // other peers still go; once some of its frames are parked, all of that peer's later ones join them.
+        const bool unicastData = result == ItlAWDL::BuildResult::Ready && output[0] == 0x08 && !(output[4] & 1);
+        const bool held = unicastData && holdPayloadFor && (holdEverySize || *written >= 1200) &&
+            ItlAWDL::sameAddress(output + 4, holdPayloadFor);
+        const bool behindParked = unicastData && parkedQueued && ItlAWDL::sameAddress(output + 4, parkedPeer);
+        if (held || behindParked) {
+            const bool shortFrame = *written < 1200;
+            if (parkedFrames && parkedQueued < parkedFrameCount &&
+                (!parkedQueued || ItlAWDL::sameAddress(output + 4, parkedPeer))) {
+                if (!parkedQueued)
+                    memcpy(parkedPeer, output + 4, sizeof(parkedPeer));
+                auto &slot = parkedFrames[(parkedHead + parkedQueued) % parkedFrameCount];
+                slot.length = frame.length;
+                memcpy(slot.bytes, frame.bytes, frame.length);
+                ++parkedQueued;
+                parkedPeak = max(parkedPeak, parkedQueued);
+                ++transmitParked;
+                if (shortFrame)
+                    ++transmitHeldShort;
+                transmitHead = (transmitHead + 1) % transmitFrameCount;
+                --transmitQueued;
+                continue;
+            }
+            // No room to park it: it waits at the head, and what is behind it waits too, as before.
             // Once per frame, not once per attempt: the pump asks again every millisecond.
-            if (*written < 1200 && transmitHeldMark != transmitPopped + 1) {
+            if (shortFrame && transmitHeldMark != transmitPopped + 1) {
                 transmitHeldMark = transmitPopped + 1;
                 ++transmitHeldShort;
             }
@@ -608,6 +1131,8 @@ bool ItlAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *wr
         --transmitQueued;
         ++transmitPopped;
         if (result == ItlAWDL::BuildResult::Ready) {
+            if (parkedQueued)
+                ++transmitPassed;   // Went ahead of the held peer's frames.
             ++transmitSequence;
             return true;
         }
@@ -634,12 +1159,15 @@ bool ItlAWDLInterface::serviceTransmit()
         setProperty("ItlwmAWDLTxAccepted", transmitAccepted, 32);
         setProperty("ItlwmAWDLTxCompleted", transmitCompleted, 32);
         setProperty("ItlwmAWDLTxDropped", transmitDropped, 32);
+        setProperty("ItlwmAWDLTxParked", transmitParked, 32);
+        setProperty("ItlwmAWDLTxParkedPeak", parkedPeak, 32);
+        setProperty("ItlwmAWDLTxPassedParked", transmitPassed, 32);
         if (auto *depths = OSData::withBytes(transmitDepthBins, sizeof(transmitDepthBins))) {
             setProperty("ItlwmAWDLTxDepthBins", depths);
             depths->release();
         }
     }
-    return transmitQueued || transmitDoneCount;
+    return transmitQueued || parkedQueued || transmitDoneCount;
 }
 
 UInt32 ItlAWDLInterface::rejectTransmit(OSObject *owner, IOSkywalkTxSubmissionQueue*,
@@ -712,6 +1240,9 @@ void ItlAWDLInterface::releaseNetworkResources()
         dataTransmitEnabled = false;
     transmitQueued = 0;
     transmitHead = 0;
+    // The held peer's copies go with the queue they came from.
+    parkedQueued = 0;
+    parkedHead = 0;
     if (registrationAttempted) {
         registrationAttempted = false;
         deregisterEthernetInterface(0);
@@ -823,6 +1354,11 @@ void ItlAWDLInterface::free()
         transmitFrames = nullptr;
         transmitFramesBytes = 0;
     }
+    if (parkedFrames) {
+        IOFree(parkedFrames, sizeof(TransmitFrame) * parkedFrameCount);
+        parkedFrames = nullptr;
+        parkedQueued = 0;
+    }
     if (configurationLock) {
         IOLockFree(configurationLock);
         configurationLock = nullptr;
@@ -851,7 +1387,7 @@ IOReturn ItlAWDLInterface::initializeNetwork(IO80211Controller *controller,
     int dataCopyArgument = 0;
     dataCopyProbeEnabled = PE_parse_boot_argn("-itlawdldatacopy", &dataCopyArgument, sizeof(dataCopyArgument));
     // -itlawdlcoexdata (normal Wi-Fi with the listener) needs delivery, transmit and the queues enabled too.
-    const bool coexData = PE_parse_boot_argn("-itlawdlcoexdata", &dataCopyArgument, sizeof(dataCopyArgument));
+    const bool coexData = itlAWDLFlag("-itlawdlcoexdata");
     dataDeliverEnabled = coexData || PE_parse_boot_argn("-itlawdldatarx", &dataCopyArgument, sizeof(dataCopyArgument));
     // The copy counters belong to the -itlawdldatacopy probe; published as zeros without it, they read as a
     // failure next to working delivery (#7). ItlwmAWDLTransportReady was never set true by anything and is
@@ -1018,10 +1554,11 @@ IOReturn ItlAWDLInterface::initializeNetwork(IO80211Controller *controller,
     noteQueueState("ItlwmAWDLQueueStateAtRegistration");
     int dataTransmit = 0;
     if (PE_parse_boot_argn("-itlawdldatatx", &dataTransmit, sizeof(dataTransmit)) ||
-        PE_parse_boot_argn("-itlawdlcoexdata", &dataTransmit, sizeof(dataTransmit))) {
-        int requestedQueue = 0;
-        if (PE_parse_boot_argn("itlawdltxqueue", &requestedQueue, sizeof(requestedQueue)) &&
-            requestedQueue >= int(transmitFrameDefault) && requestedQueue <= int(transmitFrameCapacity))
+        itlAWDLFlag("-itlawdlcoexdata")) {
+        // The tested set's itlawdltxqueue=4096 is the default; a value that is set still wins.
+        int requestedQueue = itlAWDLDefaults() ? 4096 : 0;
+        PE_parse_boot_argn("itlawdltxqueue", &requestedQueue, sizeof(requestedQueue));
+        if (requestedQueue >= int(transmitFrameDefault) && requestedQueue <= int(transmitFrameCapacity))
             transmitFrameCount = unsigned(requestedQueue);
         // A second initialisation of the same object frees the first array instead of leaking it (audit D03).
         if (transmitFrames) {
@@ -1032,12 +1569,22 @@ IOReturn ItlAWDLInterface::initializeNetwork(IO80211Controller *controller,
         transmitFrames = static_cast<TransmitFrame *>(IOMalloc(sizeof(TransmitFrame) * transmitFrameCount));
         if (transmitFrames)
             transmitFramesBytes = sizeof(TransmitFrame) * transmitFrameCount;
+        // Room to park as many frames as the FIFO holds, up to parkedFrameMax. Without it a held frame waits at
+        // the head as before.
+        if (parkedFrames) {
+            IOFree(parkedFrames, sizeof(TransmitFrame) * parkedFrameCount);
+            parkedFrames = nullptr;
+        }
+        parkedQueued = parkedHead = 0;
+        parkedFrameCount = min(transmitFrameCount, parkedFrameMax);
+        parkedFrames = static_cast<TransmitFrame *>(IOMalloc(sizeof(TransmitFrame) * parkedFrameCount));
+        setProperty("ItlwmAWDLTxParkFrames", parkedFrames ? parkedFrameCount : 0, 32);
         dataTransmitEnabled = transmitFrames != nullptr;
         setProperty("ItlwmAWDLTxQueueFrames", transmitFrameCount, 32);
     }
     int queueEnable = 0;
     if (PE_parse_boot_argn("-itlawdlqueueenable", &queueEnable, sizeof(queueEnable)) ||
-        PE_parse_boot_argn("-itlawdlcoexdata", &queueEnable, sizeof(queueEnable))) {
+        itlAWDLFlag("-itlawdlcoexdata")) {
         for (auto queue : packetQueues)
             queue->enable();
         noteQueueState("ItlwmAWDLQueueStateAfterEnable");
@@ -1065,8 +1612,7 @@ IO80211VirtualInterface *AirportItlwm::createVirtualInterface(ether_addr *addres
             interface->release();
             return nullptr;
         }
-        int nativeUp = 0;
-        if (PE_parse_boot_argn("-itlawdlnativeup", &nativeUp, sizeof(nativeUp)))
+        if (itlAWDLFlag("-itlawdlnativeup"))
             interface->acceptNativeRequests();
         interface->setProperty("ItlwmAWDLInterfaceBuild", ITL_FORBIDDEN_BUILD);
         setProperty("ItlwmAWDLFactoryStage", "initialized");
@@ -1157,13 +1703,21 @@ IOReturn AirportItlwm::buildAWDLSyncProbe(mbuf_t *packet, uint64_t nowUS)
     const auto status = interface->copyFrameConfiguration(snapshot);
     // Alternate the peer manager's service-carrying MI with sync-only PSF frames.
     // On any problem with the MI, this stays an ordinary frame.
-    const bool wantMI = awdlProbeSequence & 1;
-    size_t miLength = 0;
-    const bool isMI = status == kIOReturnSuccess && wantMI &&
-        interface->copyMasterIndication(snapshot->staticTLVs, sizeof(snapshot->staticTLVs), &miLength);
+    // a unicast MI macOS asked for goes first, to its peer, and doesn't count as the MI turn.
+    uint8_t umiPeer[6] = {};
+    size_t umiLength = 0;
+    const bool isUMI = status == kIOReturnSuccess && itlAWDLUmiPending && itlAWDLUmiGo &&
+        interface->takeUnicastMI(snapshot->staticTLVs, sizeof(snapshot->staticTLVs), &umiLength, umiPeer, nowUS);
+    const bool wantMI = !isUMI && (itlAWDLForceMI || (awdlProbeSequence & 1));   // forced MI
+    size_t miLength = isUMI ? umiLength : 0;
+    const bool isMI = isUMI || (status == kIOReturnSuccess && wantMI &&
+        interface->copyMasterIndication(snapshot->staticTLVs, sizeof(snapshot->staticTLVs), &miLength));
     const bool isPSF = !isMI && !wantMI && interface->hasMasterIndication();
-    if (isMI)
+    if (isMI) {
         snapshot->templateLength = miLength;
+        if (!isUMI)
+            itlSvcNoteMiBuilt();
+    }
     if (wantMI) {
         ++awdlSyncMIWanted;
         if (!isMI)
@@ -1192,10 +1746,34 @@ IOReturn AirportItlwm::buildAWDLSyncProbe(mbuf_t *packet, uint64_t nowUS)
         off += 3+count;
     }
     // After the check above, which still refuses a native channel-sequence TLV.
+    uint8_t execSlots[16];
+    bool exec = itlAWDLExecPlan(execSlots);   // the schedule the radio really follows
+    // Slots that can't be encoded fall back to the fixed schedule in both TLVs, never in only one of them.
+    for (unsigned i = 0; exec && i < 16; ++i)
+        if (!ItlAWDL::fixedScheduleChannel(execSlots[i])) exec = false;
+    // our own metric and counter for the driver's election, then its result and clock.
+    {
+        uint32_t selfMetric = 0, selfCounter = 0;
+        if (valid && ItlAWDL::templateSelfElection(snapshot->staticTLVs, snapshot->templateLength, &selfMetric,
+                                                   &selfCounter)) {
+            itlAWDLSelfMetric = selfMetric;
+            itlAWDLSelfCounter = selfCounter;
+            itlAWDLSelfKnown = 1;
+        }
+        uint32_t electionId = 0;
+        if (valid && ItlAWDL::templateSelfElectionId(snapshot->staticTLVs, snapshot->templateLength, &electionId)) {
+            itlAWDLSelfElectionId = electionId;
+            itlAWDLSelfElectionIdKnown = 1;
+        }
+    }
+    ItlAWDL::ElectionAdvert electAdvert{};
+    ItlAWDL::Clock electClock = ItlAWDL::ownClock();
+    const bool elect = itlAWDLClockState(&electAdvert, &electClock);
     if (valid && !isMI && awdlExtendFrames &&
         !ItlAWDL::extendWithPeerTLVs(snapshot->staticTLVs, &snapshot->templateLength,
                                      sizeof(snapshot->staticTLVs), snapshot->address, uint8_t(itlAWDLFixedChannel()),
-                                     uint8_t(itlAWDLChannelClass()), itlAWDLTwoStreams()))
+                                     uint8_t(itlAWDLChannelClass()), itlAWDLTwoStreams(), exec ? execSlots : nullptr,
+                                     elect ? &electAdvert : nullptr))
     {
         setProperty("ItlwmAWDLPeerTLVs", "not-added");
         ++awdlSyncPeerTLVsRefused;
@@ -1203,9 +1781,14 @@ IOReturn AirportItlwm::buildAWDLSyncProbe(mbuf_t *packet, uint64_t nowUS)
     uint8_t sync[73]; size_t syncLength = 0;
     const uint8_t fixedChannel = uint8_t(itlAWDLFixedChannel());
     ItlAWDL::SyncPrefix settings = {fixedChannel,fixedChannel,0,0,16,110,0x1000,16,16,0,3,3,3,3,{}};
-    memcpy(settings.master, snapshot->address, 6);
-    const auto schedule = ItlAWDL::buildLocalFixedSchedule(settings, 0, nowUS, 0,
-        sync, sizeof(sync), &syncLength);
+    memcpy(settings.master, elect ? electAdvert.master : snapshot->address, 6);
+    // the elected clock (the master's, or our own epoch-0 clock as before).
+    uint64_t clockEpochUS = 0;
+    uint16_t clockInitialAW = 0;
+    if (elect)
+        ItlAWDL::clockEpoch(electClock, nowUS, &clockEpochUS, &clockInitialAW);
+    const auto schedule = ItlAWDL::buildLocalFixedSchedule(settings, clockEpochUS, nowUS, clockInitialAW,
+        sync, sizeof(sync), &syncLength, exec ? execSlots : nullptr);
     mbuf_t result = nullptr;
     // Each way a frame can fail has its own stage and return code, so one snapshot shows which.
     IOReturn error = kIOReturnBadArgument;
@@ -1228,12 +1811,17 @@ IOReturn AirportItlwm::buildAWDLSyncProbe(mbuf_t *packet, uint64_t nowUS)
                 uint32_t(nowUS),uint32_t(nowUS),sync,syncLength,
                 snapshot->staticTLVs,snapshot->templateLength};
             memcpy(frame.source, snapshot->address, 6);
+            if (isUMI)
+                memcpy(frame.receiver, umiPeer, 6);
             size_t length = 0;
             if (ItlAWDL::buildLocalFrame(frame, static_cast<uint8_t *>(mbuf_data(result)),
                     mbuf_maxlen(result), &length) == ItlAWDL::BuildResult::Ready) {
                 mbuf_setlen(result,length); mbuf_pkthdr_setlen(result,length);
                 *packet = result; error = kIOReturnSuccess;
-                awdlProbeSequence = uint16_t((awdlProbeSequence + 1) & 4095);
+                // A unicast MI doesn't take a turn of the MI/PSF alternation (its sequence number is still new).
+                awdlProbeSequence = uint16_t((awdlProbeSequence + (isUMI ? 2 : 1)) & 4095);
+                if (isUMI)
+                    interface->noteUnicastMISent();
                 setProperty("ItlwmAWDLSyncProbeFrameLength", length, 32);
             } else mbuf_freem(result);
         }
@@ -1243,6 +1831,7 @@ IOReturn AirportItlwm::buildAWDLSyncProbe(mbuf_t *packet, uint64_t nowUS)
     if (error != kIOReturnSuccess)
         awdlProbeSequence = uint16_t((awdlProbeSequence + 1) & 4095);
     setProperty("ItlwmAWDLSyncProbeStage", error == kIOReturnSuccess ? "frame-built" : stage);
+    itlAWDLLastBuildMI = error == kIOReturnSuccess && isMI && !isUMI;
     if (error == kIOReturnSuccess)
         ++(isMI ? awdlSyncMIBuilt : isPSF ? awdlSyncPSFBuilt : awdlSyncFallbackBuilt);
     else
@@ -1376,6 +1965,12 @@ void AirportItlwm::releaseAll()
     // First, while the command gate the power calls use still exists.
     unregistPM();
     // The watchdog uses the HAL and the gate, both released below.
+    if (itlAwStartTimer) {
+        itlAwStartTimer->cancelTimeout();
+        if (fWatchdogWorkLoop)
+            fWatchdogWorkLoop->removeEventSource(itlAwStartTimer);
+        OSSafeReleaseNULL(itlAwStartTimer);
+    }
     if (watchdogTimer) {
         watchdogTimer->cancelTimeout();
         if (fWatchdogWorkLoop)
@@ -1467,12 +2062,172 @@ eventHandler(struct ieee80211com *ic, int msgCode, void *data)
 #endif
 }
 
+// see itlAwdlStatsState.
+static void itlReportAWDLData(AirportItlwm *self)
+{
+    if (!itlAwdlStatsState) {
+        itlAwdlStatsState = itlResFlag("-itlawdlstats", 0x1) && kItlAwdlPmRxOff ? 2 : 1;
+    }
+    uint32_t rx = 0, tx = 0;
+    // Supported-builds audit: these offsets were checked on the verified kernel + macOS pairs. Like the master
+    // indication copy, this runs there, and with -itlawdlanybuild on any other build (itlAWDLBuildForced).
+    if (itlAwdlStatsState != 2 || !self || !self->fAWDLInterface || !(itlAWDLBuildVerified() || itlAWDLBuildForced()) ||
+        !itlAWDLDataCounts(&rx, &tx))
+        return;
+    ++itlAwdlStatsCalls;
+    const uint32_t rxDelta = itlAwdlStatsPrimed && rx >= itlAwdlStatsLastRx ? rx - itlAwdlStatsLastRx : 0;
+    const uint32_t txDelta = itlAwdlStatsPrimed && tx >= itlAwdlStatsLastTx ? tx - itlAwdlStatsLastTx : 0;
+    itlAwdlStatsPrimed = true;
+    itlAwdlStatsLastRx = rx;
+    itlAwdlStatsLastTx = tx;
+    if (!rxDelta && !txDelta)
+        return;
+    // The peer manager through macOS's own accessor, and only if it is one: its vtable must be
+    // IO80211AWDLPeerManager's (address point = symbol + two words). Anything else turns the counters off for good.
+    auto *pm = static_cast<uint8_t *>(itlSkywalkGetPeerManager(static_cast<IO80211SkywalkInterface *>(
+        static_cast<ItlAWDLInterface *>(self->fAWDLInterface))));
+    if (!pm) {
+        ++itlAwdlStatsNoPath;
+        return;
+    }
+    if (reinterpret_cast<uintptr_t>(pm) < 0xffffff8000000000ULL ||
+        *reinterpret_cast<const uintptr_t *>(pm) != reinterpret_cast<uintptr_t>(itlNativeAWDLPeerManagerVtable + 2)) {
+        ++itlAwdlStatsWrongPm;
+        itlAwdlStatsState = 1;
+        self->setProperty("ITLAWDLDataStats", "off: getPeerManager() didn't return an IO80211AWDLPeerManager");
+        return;
+    }
+    uint8_t *state = *reinterpret_cast<uint8_t **>(pm + 0x18);
+    if (reinterpret_cast<uintptr_t>(state) < 0xffffff8000000000ULL) {
+        ++itlAwdlStatsNoPath;
+        return;
+    }
+    if (rxDelta) {
+        __atomic_fetch_add(reinterpret_cast<uint32_t *>(state + kItlAwdlPmRxOff), rxDelta, __ATOMIC_RELAXED);
+        itlAwdlStatsAdded += rxDelta;
+    }
+    if (txDelta) {
+        __atomic_fetch_add(reinterpret_cast<uint32_t *>(state + kItlAwdlPmTxOff), txDelta, __ATOMIC_RELAXED);
+        itlAwdlStatsAddedTx += txDelta;
+    }
+}
+
+// see itlAwStartState.
+static void itlAwStartFire(OSObject *owner, IOTimerEventSource *sender)
+{
+    auto self = OSDynamicCast(AirportItlwm, owner);
+    if (!self || !sender)
+        return;
+    uint8_t ev[36];
+    uint64_t next = 100000;
+    if ((itlAwStartPosted + itlAwStartIdle) % 4 == 0)
+        itlReportAWDLData(self);   // about 4 per second
+    // close the AW that just ended before opening the next one, as the chip does.
+    uint8_t end[40];
+    if (self->fAWDLInterface && itlAWDLAwEnd(end, sizeof(end)))
+        static_cast<ItlAWDLInterface *>(self->fAWDLInterface)->postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_END, end,
+                                                                          sizeof(end), false);
+    if (self->fAWDLInterface && itlAWDLAwStart(ev, &next)) {
+        static_cast<ItlAWDLInterface *>(self->fAWDLInterface)->postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START, ev,
+                                                                          sizeof(ev), false);
+        ++itlAwStartPosted;
+    } else {
+        ++itlAwStartIdle;
+    }
+    if (next < 2000)
+        next = 2000;
+    if (next > 200000)
+        next = 200000;
+    sender->setTimeoutUS(uint32_t(next));
+}
+
+// see itlInfraStatsState. Runs from the 1 s watchdog, in the gate.
+void AirportItlwm::reportInfraTraffic()
+{
+    if (!itlInfraStatsState) {
+        itlInfraStatsState = itlResFlag("-itlinfrastats", 0x1) ? 2 : 1;
+    }
+    if (itlInfraStatsState != 2 || !fNetIf || !bsdInterface || !fHalService)
+        return;
+    ifnet_t bsd = bsdInterface->getIfnet();
+    struct ifnet_stats_param st;
+    memset(&st, 0, sizeof(st));
+    if (!bsd || ifnet_stat(bsd, &st) != 0) {
+        ++itlInfraStatFails;
+        return;
+    }
+    auto delta = [](uint64_t now, uint64_t &last) -> int {
+        const uint64_t d = now >= last ? now - last : 0;   // a reset counter gives 0 once
+        last = now;
+        return d > 0x7fffffffULL ? 0x7fffffff : int(d);
+    };
+    const int allIn = delta(st.packets_in, itlInfraLastPkIn), allByIn = delta(st.bytes_in, itlInfraLastByIn);
+    const int allOut = delta(st.packets_out, itlInfraLastPkOut), allByOut = delta(st.bytes_out, itlInfraLastByOut);
+    const int mcIn = delta(st.multicasts_in, itlInfraLastMcIn), mcOut = delta(st.multicasts_out, itlInfraLastMcOut);
+    if (!itlInfraStatsPrimed) {   // the first read only sets the baseline
+        itlInfraStatsPrimed = true;
+        return;
+    }
+    // unicast packets, and bytes in proportion (64-bit, no overflow for int inputs).
+    const int pkIn = allIn > mcIn ? allIn - mcIn : 0, pkOut = allOut > mcOut ? allOut - mcOut : 0;
+    const int byIn = allIn > 0 ? int((int64_t)allByIn * pkIn / allIn) : 0;
+    const int byOut = allOut > 0 ? int((int64_t)allByOut * pkOut / allOut) : 0;
+    itlInfraSumMcIn += mcIn;
+    itlInfraSumMcOut += mcOut;
+    auto netif = static_cast<IO80211SkywalkInterface *>(fNetIf);
+    if (fHalService->get80211Controller()->ic_state == IEEE80211_S_RUN) {
+        if (pkIn > 0)
+            itlRecordInputPacket(netif, pkIn, byIn);
+        if (pkOut > 0)
+            itlRecordOutputPacket(netif, 0 /* APPLE80211_WME_AC_BE */, pkOut, byOut);
+        itlInfraSumPkIn += pkIn;
+        itlInfraSumByIn += byIn;
+        itlInfraSumPkOut += pkOut;
+        itlInfraSumByOut += byOut;
+    }
+    if (++itlInfraTicks % 5 == 0) {
+        char s[220];
+        snprintf(s, sizeof(s), "ticks %u fails %u; reported (unicast) in %llu pkts %llu bytes, out %llu pkts %llu bytes; "
+                 "left out multicast/broadcast in %llu out %llu",
+                 itlInfraTicks, itlInfraStatFails, (unsigned long long)itlInfraSumPkIn,
+                 (unsigned long long)itlInfraSumByIn, (unsigned long long)itlInfraSumPkOut,
+                 (unsigned long long)itlInfraSumByOut, (unsigned long long)itlInfraSumMcIn,
+                 (unsigned long long)itlInfraSumMcOut);
+        setProperty("ITLInfraStats", s);
+    }
+}
+
 void AirportItlwm::watchdogAction(IOTimerEventSource *timer)
 {
     if (!fHalService)
         return;
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     (*ifp->if_watchdog)(ifp);
+    reportInfraTraffic();   // -itlinfrastats only
+    itlReportAWDLData(this);   // -itlawdlstats only (also from the AW-start timer)
+    if (!itlAwStartState) {   // started once, from the watchdog
+        itlAwStartState = itlResFlag("-itlawstart", 0x1) ? 2 : 1;
+        if (itlAwStartState == 2 && fWatchdogWorkLoop) {
+            itlAwStartTimer = IOTimerEventSource::timerEventSource(this, itlAwStartFire);
+            if (itlAwStartTimer && fWatchdogWorkLoop->addEventSource(itlAwStartTimer) == kIOReturnSuccess) {
+                itlAwStartTimer->setTimeoutMS(100);
+            } else {
+                OSSafeReleaseNULL(itlAwStartTimer);
+            }
+        }
+    }
+    if (itlAwStartTimer && ++itlAwStartWatch % 5 == 0) {
+        char aw[96];
+        snprintf(aw, sizeof(aw), "posted %u idle %u", itlAwStartPosted, itlAwStartIdle);
+        setProperty("ITLAWDLAwStartPosts", aw);
+    }
+    if (itlAwdlStatsState == 2 && itlAwStartWatch % 5 == 0) {
+        char st[160];
+        snprintf(st, sizeof(st), "calls %u; rx seen %u added %u; tx seen %u added %u; no path %u; not a peer manager %u%s",
+                 itlAwdlStatsCalls, itlAwdlStatsLastRx, itlAwdlStatsAdded, itlAwdlStatsLastTx, itlAwdlStatsAddedTx,
+                 itlAwdlStatsNoPath, itlAwdlStatsWrongPm, itlAWDLBuildVerified() ? "" : " (-itlawdlanybuild)");
+        setProperty("ITLAWDLDataStats", st);
+    }
 #ifdef AIRPORT_WCL
     if (fNetIf)
         static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->wclPostLinkQuality();
@@ -1510,11 +2265,13 @@ bool AirportItlwm::init(OSDictionary *properties)
     fAWDLInterface = nullptr;
     int awdlBootValue = 0;
     // AirDrop only starts on a macOS build whose Wi-Fi stack was verified (AWDLBuildGuard.cpp).
-    awdlInterfaceTest = itlAWDLBuildAllowed() &&
-        PE_parse_boot_argn("-itlawdliface", &awdlBootValue, sizeof(awdlBootValue));
+    awdlInterfaceTest = itlAWDLBuildAllowed() && itlAWDLFlag("-itlawdliface");
     setProperty("ItlwmAWDLBuildCheck", itlAWDLBuildStatus());
+    // From 0.7.0-alpha.2: whether the tested set is on without its flags (check_compat.sh reads this).
+    setProperty("ItlwmAWDLDefaults", itlAWDLDefaults() ? "on: the tested set needs no Wi-Fi flags" :
+                "off (-itlawdlnodefaults): only the flags that are set count");
     awdlRawSamples = PE_parse_boot_argn("-itlawdlsamples", &awdlBootValue, sizeof(awdlBootValue));
-    awdlExtendFrames = PE_parse_boot_argn("-itlawdlelicit", &awdlBootValue, sizeof(awdlBootValue));
+    awdlExtendFrames = itlAWDLFlag("-itlawdlelicit");
     awdlCreateRequests = 0;
     awdlManagementInputEnabled = false;
     awdlManagementActive = 0;
@@ -1952,9 +2709,13 @@ bool AirportItlwm::startDriver(IOService *provider)
     setLinkStatus(kIONetworkLinkValid);
     if (TAILQ_EMPTY(&fHalService->get80211Controller()->ic_ess))
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
+    // The HAL built its rate set at the first firmware load: record the card's streams for -itlawdlcaps.
+    setProperty("ItlwmCardStreams", uint32_t(itlAWDLNoteCardStreams(fHalService->get80211Controller())), 32);
 #ifdef AIRPORT_WCL
     awdlManagementInputEnabled = true;
     bsdInterface->registerService();
+#else
+    awdlManagementInputEnabled = true;
 #endif
     registerService();
     return true;
@@ -2055,7 +2816,7 @@ IOReturn AirportItlwm::enable(IO80211SkywalkInterface *netif)
         return kIOReturnNotReady;
     _fCommandGate->enable();
     if (power_state)
-        enableAdapter(bsdInterface);
+        enableAdapterWhenPowered();
     return kIOReturnSuccess;
 }
 
@@ -2530,6 +3291,10 @@ getCARD_CAPABILITIES(OSObject *object,
                            0x80
                            );
     *(uint16_t *)&cd->capabilities[8] = 0x201;
+
+    if (awdlInterfaceTest) {
+        cd->capabilities[4] |= 0x01;
+    }
 //
 //    cd->capabilities[2] |= 0x10;
 //    cd->capabilities[5] |= 0x1;
@@ -2661,6 +3426,7 @@ setPOWER(OSObject *object,
         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & IFF_RUNNING) != 0;
         if (pd->power_state[0] == 0) {
             fHalService->get80211Controller()->ic_wcl_mac_reconfig = false;
+            enableAwaitingPowerOn = false;
             changePowerStateToPriv(kPowerStateOff);
             if (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) {
                 net80211_ifstats(fHalService->get80211Controller());
@@ -2669,7 +3435,7 @@ setPOWER(OSObject *object,
         } else {
             changePowerStateToPriv(kPowerStateOn);
             if (!isRunning)
-                enableAdapter(bsdInterface);
+                enableAdapterWhenPowered();
         }
         power_state = (pd->power_state[0]);
     }
@@ -2682,6 +3448,7 @@ setPOWER(OSObject *object,
     if (pd->num_radios > 0) {
         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) != 0;
         if (pd->power_state[0] == 0) {
+            enableAwaitingPowerOn = false;
             changePowerStateToPriv(1);
             if (isRunning) {
                 net80211_ifstats(fHalService->get80211Controller());
@@ -2690,7 +3457,7 @@ setPOWER(OSObject *object,
         } else {
             changePowerStateToPriv(2);
             if (!isRunning)
-                enableAdapter(bsdInterface);
+                enableAdapterWhenPowered();
         }
         power_state = (pd->power_state[0]);
     }
@@ -2935,6 +3702,7 @@ void AirportItlwm::setPowerStateOff()
 {
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOff;
+    enableAwaitingPowerOn = false;
     disableAdapter(bsdInterface);
     pmPolicyMaker->acknowledgeSetPowerState();
 }
@@ -2944,4 +3712,28 @@ void AirportItlwm::setPowerStateOn()
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOn;
     pmPolicyMaker->acknowledgeSetPowerState();
+    // Wi-Fi was asked for while the card was still off (#38): start it now that it's powered.
+    if (enableAwaitingPowerOn && power_state) {
+        enableAwaitingPowerOn = false;
+        XYLog("%s: starting the deferred Wi-Fi enable\n", __FUNCTION__);
+        enableAdapter(bsdInterface);
+    }
+}
+
+// #38: on a full wake macOS can ask for Wi-Fi (setPOWER, or the interface's enable) a few milliseconds
+// before the power manager has powered the card back on (setPowerStateOn). The card then reads all-ones,
+// initialization fails, and nothing retried it, so Wi-Fi stayed off until it was toggled. While the
+// power state is off, remember the request instead, and start the adapter in setPowerStateOn. A power-off
+// or a Wi-Fi-off request in between drops it, so a dark wake never starts Wi-Fi. Before power management
+// is registered there is no power state to wait for, so Wi-Fi starts at once, as before.
+void AirportItlwm::enableAdapterWhenPowered()
+{
+    if (pmPolicyMaker && pmPowerState != kPowerStateOn) {
+        enableAwaitingPowerOn = true;
+        setProperty("ItlwmEnableDeferrals", ++enableDeferrals, 32);
+        XYLog("%s: power is off, starting Wi-Fi once it's on\n", __FUNCTION__);
+        return;
+    }
+    enableAwaitingPowerOn = false;
+    enableAdapter(bsdInterface);
 }

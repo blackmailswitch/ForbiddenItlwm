@@ -25,7 +25,12 @@ int main() {
         assert(parseIPv6DataPayload(frame,len,&rejected)!=ParseResult::Valid);
         assert(rejected.bytes==ip && rejected.length==7 && rejected.sequence==9);
     }
-    for(unsigned offset: {0U,3U,6U,8U,12U,14U,16U,20U}) {
+    // The two bytes macOS sets per frame are reported, whatever they are.
+    frame[8]=0;frame[9]=7;
+    assert(parseIPv6DataPayload(frame,n,&view)==ParseResult::Valid && view.minExtension==0 && view.presence==7);
+    frame[8]=3;frame[9]=4;
+    assert(parseIPv6DataPayload(frame,n,&view)==ParseResult::Valid && view.minExtension==3 && view.presence==4);
+    for(unsigned offset: {0U,3U,6U,12U,14U,16U,20U}) {
         frame[offset]^=(offset==16 ? 0x10 : 1);
         assert(parseIPv6DataPayload(frame,n,&view)!=ParseResult::Valid);
         frame[offset]^=(offset==16 ? 0x10 : 1);

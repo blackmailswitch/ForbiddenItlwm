@@ -20,6 +20,8 @@ struct AddbaRequest {
 // requests for other TIDs, including those waiting for a DELBA to finish.
 struct PendingAddbaRequests {
     bool empty() const { return !pending; }
+    // The peer the waiting requests are from (they are all from one), or null.
+    const uint8_t *peer() const { return pending ? requests[__builtin_ctz(pending)].peer : nullptr; }
     bool has(unsigned tid) const { return tid < 8 && (pending & (1U << tid)); }
     void clear() { pending = 0; }
     void discard(unsigned tid) {

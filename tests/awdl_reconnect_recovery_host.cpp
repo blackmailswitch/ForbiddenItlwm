@@ -13,6 +13,9 @@
 #include <vector>
 #include <algorithm>
 #include <libkern/OSByteOrder.h>
+#include "AWDLPeerHandoff.hpp"
+// PEER_SLOT
+static void awdlPeerHoldFree(unsigned) {}   // held further-slot frames (none in these tests)
 #define htole32 OSSwapHostToLittleInt32
 #define htole16 OSSwapHostToLittleInt16
 #define IEEE80211_ADDR_COPY(dst, src) memcpy(dst, src, 6)
@@ -41,7 +44,6 @@ enum { IWX_FLAG_SHUTDOWN = 1, IWX_FLAG_SCANNING = 2, IWX_FW_CTXT_ACTION_ADD = 1,
 using IOReturn = int;
 using OSObject = void;
 using AbsoluteTime = uint64_t;
-namespace ItlAWDL { struct BaFilterState {}; }
 struct Pending { void clear() {} };
 struct ieee80211_channel {};
 struct iwx_phy_ctxt { int id = 0, color = 0; ieee80211_channel *channel = nullptr; };
@@ -64,6 +66,9 @@ static int awdlCoexSetupAttempts, awdlCoexSetupAborts, awdlCoexQueueAssigned, aw
 static uint32_t awdlCoexQueueWritePointer, awdlCoexStaResult, awdlCoexQueueResult, awdlCoexSetupToken;
 static int awdlCoexTxSettingUpGen = -1;
 static uint32_t awdlCoexTxSettingUpOwner, awdlCoexTxSettingUpNext;
+static void *awdlMcastHold[16];   // held multicast frames (none in these tests)
+static void mbuf_freem(void *) {}
+static unsigned awdlMcastHeld;
 static int awdlCoexStationTransitionGen = -1, awdlCoexStationReadyGen = 7;
 static uint32_t awdlCoexStationTransitionOwner, awdlCoexStationTransitionNext;
 static bool awdlCoexProbe = true, awdlCoexWant = true;
@@ -71,7 +76,7 @@ static uint64_t awdlCoexLastCompletionUS, awdlCoexTxPauseUntilUS;
 static const char *awdlCoexQueueStage;
 static bool awdlCoexAdded, awdlCoexTxStaAdded, awdlCoexInFlight, awdlCoexAddrApplied,
     awdlCoexMulti, awdlCoexMultiActive, awdlCoexMovePending, awdlCoexPromiscLive,
-    awdlCoexPromiscUncertain, awdlCoexBaPeerAdded, awdlCoexBaPeerAccepted,
+    awdlCoexPromiscUncertain,
     awdlCoexBaFilterOff, awdlCoexRemoveRequested, awdlStopping, awdlCoexLowLatency,
     awdlCoexAddrKnown, awdlCoexTx, awdlCoexTxHalted;
 // PR #47's same-channel window, which the listener teardown resets (merged after this harness was written).
@@ -82,8 +87,7 @@ static struct {
 static int awdlCoexGeneration = 7, awdlCoexAddingGen = -1, awdlCoexRemovingGen = -1,
     awdlCoexBrokenGeneration = -1, awdlCoexPhyUncertainGen = -1,
     awdlCoexWide80FailedGen = -1, awdlCoexPendingSlot = -1, awdlCoexBaGen,
-    awdlCoexBaTids, awdlCoexBaAnswerLength, awdlCoexBaTxState, awdlCoexBaTxQueue,
-    awdlCoexBaTidTeardown, awdlCoexBaRxIdleTids, awdlCoexQueue = -1,
+    awdlCoexQueue = -1,
     awdlCoexTxSetupTried, awdlCoexPhyWidth, awdlCoexOwnWidth,
     awdlCoexPhyResult, awdlCoexMultiBindResult, awdlCoexMacResult, awdlCoexBindStatus,
     awdlCoexBindResult, awdlCoexLowLatencyResult, awdlCoexTeardownErrors,
@@ -95,7 +99,7 @@ static bool awdlCoexLostToRestart;
 static uint64_t awdlCoexLastMoveUS;
 static ieee80211_channel *awdlCoexOwnChan;
 static const char *awdlCoexMultiState;
-static Pending awdlCoexBaRequestsPending;
+static ItlAWDL::PeerHandoff awdlCoexPeerHandoff;
 static ItlAWDL::BaFilterState awdlCoexBaFilter;
 static uint8_t awdlCoexAddr[6], awdlCoexAddrInFirmware[6];
 static std::vector<std::string> events;
@@ -114,6 +118,10 @@ static void pauseFirmware() {
 }
 static int systq, restarts;
 static void task_add(int, int *) { ++restarts; events.push_back("restart"); }
+static void itlFwNoteRestart(unsigned) {}   // crash counter, off in the driver unless -itlfwcrashrec
+// handle, off in the driver unless -itlschedhandle: never added here, so never removed.
+static bool awdlSchedHandleAdded = false, awdlSchedHandleOff = false; static int awdlSchedHandleGen = -1;
+static uint32_t awdlSchedHandleRemoves, awdlSchedHandleErr;
 static int splnet() { return 0; }
 static void splx(int) {}
 static bool isset(int *a, int n) { return a[n]; }
@@ -156,6 +164,8 @@ public:
     int awdlCoexPickOwn(iwx_softc *, uint8_t *) { return 0; }
     int iwx_phy_ctxt_cmd(iwx_softc *, iwx_phy_ctxt *, int, int, int, int) { return 0; }
     uint8_t iwx_lookup_cmd_ver(iwx_softc *, int, int) { return 1; }
+    int awdlSchedHandleMac(iwx_softc *, uint32_t) { return 0; }   // unreachable here
+    void awdlSchedCh6Remove(iwx_softc *) {}   // channel 6's handle, never added here
     int awdlCoexMacSend(iwx_softc *, int action) {
         events.push_back(action == IWX_FW_CTXT_ACTION_ADD ? "mac-add" : "mac-remove");
         if (action == IWX_FW_CTXT_ACTION_ADD &&
@@ -181,7 +191,7 @@ public:
         if (scenario.find("setup-queue") == 0) pauseFirmware();
         return suffix("negative") ? -ECANCELED : 1;
     }
-    int awdlCoexBaRemovePeer(iwx_softc *) { events.push_back("peer-remove"); return 0; }
+    int awdlCoexBaRemoveAllPeers(iwx_softc *) { events.push_back("peer-remove"); return 0; }
     int iwx_flush_sta_tids(iwx_softc *sc, int sta, int tids) {
         assert(sta == IWX_MONITOR_STA_ID && tids == 0xffff);
         events.push_back("flush");
@@ -227,6 +237,12 @@ int Gate::restartWhileWaiting() {
     awdlCoexAddingGen = driver->com.sc_generation;
     awdlCoexAdded = awdlCoexTxStaAdded = true;
     ++awdlCoexAddingOwner;
+    // New-generation receive work may arrive while an old task sleeps.
+    ItlAWDL::AddbaRequest challenger{};
+    challenger.immediate = true;
+    challenger.peer[0] = 2;
+    assert(awdlCoexPeerHandoff.note(challenger, awdlUptimeUS(),
+                                   driver->com.sc_generation, awdlCoexToken, 9));
     if (setupCase()) {
         awdlCoexTxSettingUpGen = driver->com.sc_generation;
         awdlCoexTxSettingUpOwner = ++awdlCoexTxSettingUpNext;
@@ -256,6 +272,25 @@ int main(int argc, char **argv) {
     awdlCoexAdded = scenario != "tx-only" && scenario != "no-owner";
     awdlCoexTxStaAdded = scenario == "tx-only" || scenario == "tx-failure" || scenario == "normal" || scenario == "remove-restart";
     awdlCoexQueue = awdlCoexTxStaAdded ? 1 : -1;
+    if (scenario == "handoff-generation-reset" || scenario == "handoff-current-generation") {
+        ItlAWDL::AddbaRequest challenger{};
+        challenger.immediate = true;
+        challenger.peer[0] = 2;
+        const int oldGeneration = sc.sc_generation;
+        const uint32_t oldToken = awdlCoexToken;
+        assert(awdlCoexPeerHandoff.note(challenger, awdlUptimeUS(), oldGeneration, oldToken, 9));
+        if (scenario == "handoff-generation-reset") {
+            ++sc.sc_generation;
+            assert(driver->awdlCoexListener(&sc, false) == 0);
+            assert(!awdlCoexPeerHandoff.valid);
+            assert(awdlCoexGeneration == sc.sc_generation && awdlCoexToken != oldToken);
+        } else {
+            assert(driver->awdlCoexListener(&sc, true) == 0);
+            assert(awdlCoexPeerHandoff.current(awdlUptimeUS(), oldGeneration, oldToken, 9));
+        }
+        assert(events.empty());
+        return 0;
+    }
     if (scenario == "exit-listener-failure" || scenario == "transition-guard") {
         if (scenario == "exit-listener-failure")
             awdlCoexBrokenGeneration = sc.sc_generation;
@@ -374,6 +409,7 @@ int main(int argc, char **argv) {
             assert(awdlCoexAdded && awdlCoexTxStaAdded && restarts == 0);
             assert(awdlCoexTxSettingUpGen == sc.sc_generation && awdlCoexTxSettingUpOwner != 0);
             assert(awdlCoexQueue == 2 && !saw("ring-reset"));
+            assert(awdlCoexPeerHandoff.current(awdlUptimeUS(), sc.sc_generation, awdlCoexToken, 9));
         } else if (suffix("shutdown")) {
             assert(!saw("mac-remove") && !saw("run-stop") && !saw("commit") && restarts == 0);
         } else if (suffix("failure") || suffix("timeout")) {
@@ -409,6 +445,7 @@ int main(int argc, char **argv) {
         if (scenario == "restart" || scenario == "add-restart") {
             assert(awdlCoexAdded && !saw("mac-remove"));
             assert(awdlCoexAddingGen == sc.sc_generation && awdlCoexAddingOwner != 0);
+            assert(awdlCoexPeerHandoff.current(awdlUptimeUS(), sc.sc_generation, awdlCoexToken, 9));
         }
         else assert(!saw("sta-remove"));
     } else if (scenario == "normal" || scenario == "remove-wait") {

@@ -7,7 +7,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="forbiddenitlwm-tests-") as directory:
-    for name in ("awdl_requested_configuration", "awdl_protocol", "awdl_frame_builder", "awdl_sync_prefix", "awdl_local_schedule", "awdl_probe_policy", "awdl_data_payload", "awdl_data_frame", "awdl_observation", "awdl_regulatory", "awdl_tx_burst", "awdl_peer_schedule", "awdl_build_guard", "btleadv_hci", "eapol_key_length", "wcl_transition", "counted_copy", "scan_cursor"):
+    for name in ("awdl_requested_configuration", "awdl_protocol", "awdl_frame_builder", "awdl_sync_prefix", "awdl_local_schedule", "awdl_probe_policy", "awdl_data_payload", "awdl_data_frame", "awdl_observation", "awdl_regulatory", "awdl_tx_burst", "awdl_peer_schedule", "awdl_peer_slots", "awdl_session_follow", "awdl_exec_plan", "awdl_election", "awdl_build_guard", "btleadv_hci", "btleadv_verify", "eapol_key_length", "ptk_derive", "wcl_transition", "counted_copy", "scan_cursor"):
         output = Path(directory) / name
         subprocess.run([
             "xcrun", "clang++", "-std=c++14",
@@ -28,6 +28,10 @@ with tempfile.TemporaryDirectory(prefix="forbiddenitlwm-tests-") as directory:
                     "-I" + str(root / "include"), "-fsanitize=address,undefined",
                     str(root / "tests" / "awdl_build_guard.cpp"), "-o", str(output)], check=True)
     subprocess.run([str(output)], check=True)
+# check-my-mac.pl: its BTLEAdvFixup pattern table must match BTLEAdvPatches.hpp, and it must parse with the system perl.
+subprocess.run(["python3", str(root / "tools/gen_check_my_mac.py"), "--check"], check=True)
+subprocess.run(["/usr/bin/perl", "-c", str(root / "tools/check-my-mac.pl")], check=True, capture_output=True)
+print("check-my-mac.pl: parses")
 subprocess.run(["python3", str(root / "tests/monitor_tx_ownership.py")], check=True)
 subprocess.run(["python3", str(root / "tests/monitor_channel.py")], check=True)
 subprocess.run(["python3", str(root / "tests/monitor_probe.py")], check=True)
@@ -36,12 +40,18 @@ subprocess.run(["python3", str(root / "tests/awdl_reconnect_recovery.py")], chec
 # Joins in crowded places and on 802.1X networks: extracted net80211 bodies (#69, runmain).
 subprocess.run(["python3", str(root / "tests/node_cache_join.py")], check=True)
 subprocess.run(["python3", str(root / "tests/wcl_enterprise_link.py")], check=True)
+subprocess.run(["python3", str(root / "tests/awdl_tlc_rates.py")], check=True)
 # The pattern set for the bluetoothd installed here (PR #1); 26.7.1's set elsewhere.
 build = subprocess.check_output(["sw_vers", "-buildVersion"], text=True).strip()
 pattern_set = {"25G241": "2671", "25G332": "2672", "25G342": "2673"}.get(build, "2671")
 subprocess.run(["python3", str(root / "tests/btleadv_patterns.py"), "--set", pattern_set], check=True)
 # The same-channel probe model and its source pins (PR #47); it builds its own test (audit T02).
 subprocess.run(["python3", str(root / "tests/portable_rx/test-samech.py")], check=True)
+# PR #50: the idle receive-peer handoff (-itlawdlpeerhandoff), its helper and its ADDBA dispatch.
+subprocess.run(["python3", str(root / "tests/portable_rx/test-handoff.py")], check=True)
+subprocess.run(["python3", str(root / "tests/portable_rx/test-handoff-rx.py")], check=True)
+# Several AWDL peers, each with its own receive Block Ack station (-itlawdlmultipeer).
+subprocess.run(["python3", str(root / "tests/awdl_multi_peer.py")], check=True)
 # The Sonoma set needs a 14.8.9 bluetoothd. Point this at one to check it.
 if os.environ.get("FORBIDDEN_SONOMA_BLUETOOTHD"):
     subprocess.run(["python3", str(root / "tests/btleadv_patterns.py"), "--target", "sonoma",
@@ -63,3 +73,4 @@ with tempfile.TemporaryDirectory(prefix="forbidden-lqm-") as directory:
     subprocess.run(["xcrun", "clang++", "-std=c++14", "-fsanitize=address,undefined",
                     str(root / "tests/wcl_lqm_merge.cpp"), "-o", output], check=True)
     subprocess.run([output], check=True)
+subprocess.run(["python3", str(root / "tests/awdl_tx_park.py")], check=True)
