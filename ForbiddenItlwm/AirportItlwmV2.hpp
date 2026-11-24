@@ -182,6 +182,7 @@ public:
     bool createMediumTables(const IONetworkMedium **primary);
     void releaseAll();
     void watchdogAction(IOTimerEventSource *timer);
+    void reportInfraTraffic();   // (-itlinfrastats), non-virtual
     
     virtual SInt32 enableFeature(IO80211FeatureCode, void*) override;
     virtual bool isCommandProhibited(int command) override {
@@ -278,7 +279,11 @@ public:
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;
     UInt32 pmPowerState;
-    IOService *pmPolicyMaker;
+    // Wi-Fi was asked to start while the card's power was still off (#38); started in setPowerStateOn.
+    bool enableAwaitingPowerOn = false;
+    uint32_t enableDeferrals = 0;
+    void enableAdapterWhenPowered();
+    IOService *pmPolicyMaker = nullptr;
     UInt8 pmPCICapPtr;
     bool magicPacketEnabled;
     bool magicPacketSupported;

@@ -12,7 +12,12 @@ int main() {
     // The master indication copy needs the pair, never the kernel alone (audit P-A08).
     assert(buildPairVerified(n9, "23J631") && !buildPairVerified(n9, nullptr) && !buildPairVerified(n9, "") &&
            !buildPairVerified(n9, "23J632"));
-    // Only 14.8.9 so far: an earlier 14.8.x kernel isn't "expected", it's unknown.
+    const char *n3 = "root:xnu-10063.141.1.708.2~1/RELEASE_X86_64", *n4 = "root:xnu-10063.141.1.710.3~1/RELEASE_X86_64";
+    assert(checkBuild(n3, "23J220") == BuildCheck::Verified && buildPairVerified(n3, "23J220"));   // 14.8.3
+    assert(checkBuild(n4, "23J319") == BuildCheck::Verified && buildPairVerified(n4, "23J319"));   // 14.8.4
+    assert(checkBuild(n4, "23J220") == BuildCheck::UnknownBuild && !buildPairVerified(n9, "23J319"));
+    assert(buildPairVerified("root:xnu-10063.141.1.712.16~1/RELEASE_X86_64", "23J520") && buildPairVerified(n9, "23J620"));   // 14.8.7, 14.8.8
+    // A 14.8.x kernel not on the list isn't "expected", it's unknown.
     assert(checkBuild("root:xnu-10063.141.1.712.5~1/RELEASE_X86_64", nullptr) == BuildCheck::UnknownKernel);
     assert(checkBuild("root:xnu-10063.141.1.713.39~1/DEVELOPMENT_X86_64", nullptr) == BuildCheck::UnknownKernel);
     assert(checkBuild("root:xnu-11417.140.69.713.47~2/RELEASE_X86_64", "24H241") == BuildCheck::UnknownKernel);   // Sequoia kernel
@@ -28,6 +33,14 @@ int main() {
     assert(checkBuild(sx, nullptr) == BuildCheck::Expected);
     assert(buildPairVerified(s1, "24H23") && buildPairVerified(s3, "24H241") && !buildPairVerified(s3, nullptr));
     assert(!buildPairVerified(s1, "24H241") && !buildPairVerified(sx, "24H32"));   // expected is never verified
+    // 15.8.1 runs 15.8's kernel, 15.8.2 (both builds) 15.8.3's; the 15.7.x builds have their own kernels.
+    assert(buildPairVerified(s1, "24H32") && buildPairVerified(s3, "24H230") && buildPairVerified(s3, "24H232"));
+    assert(!buildPairVerified(s1, "24H232") && !buildPairVerified(s3, "24H32"));
+    const char *s73 = "root:xnu-11417.140.69.705.2~1/RELEASE_X86_64", *s74 = "root:xnu-11417.140.69.708.3~1/RELEASE_X86_64",
+               *s79 = "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64";
+    assert(buildPairVerified(s73, "24G419") && buildPairVerified(s74, "24G517") && buildPairVerified(s79, "24G830"));
+    assert(buildPairVerified(s79, "24G824") && !buildPairVerified(s73, "24G824"));   // 15.7.8 shares 15.7.9's kernel
+    assert(checkBuild(s73, "24G517") == BuildCheck::UnknownBuild && checkBuild(s73, nullptr) == BuildCheck::Verified);
     assert(checkBuild("root:xnu-11417.140.69.712.80~3/DEVELOPMENT_X86_64", nullptr) == BuildCheck::UnknownKernel);
     assert(checkBuild("root:xnu-11417.121.6~2/RELEASE_X86_64", nullptr) == BuildCheck::UnknownKernel);   // older Sequoia
     assert(checkBuild("root:xnu-12377.161.15.700.19~2/RELEASE_X86_64", "25G241") == BuildCheck::UnknownKernel);  // Tahoe kernel
@@ -40,6 +53,8 @@ int main() {
     assert(checkBuild(k1, "25G241") == BuildCheck::Verified);
     assert(checkBuild(k2, "25G332") == BuildCheck::Verified);
     assert(checkBuild(k2, "25G342") == BuildCheck::Verified);
+    assert(buildPairVerified(k1, "25G229") && buildPairVerified(k2, "25G330"));   // 26.7, and 26.7.2's other build
+    assert(!buildPairVerified(k2, "25G229") && !buildPairVerified(k1, "25G330"));
     assert(checkBuild(k1, "") == BuildCheck::Verified);          // osversion not set yet
     assert(checkBuild(k2, nullptr) == BuildCheck::Verified);
     assert(checkBuild(k1, "25G332") == BuildCheck::UnknownBuild); // build and kernel must agree

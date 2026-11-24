@@ -100,5 +100,23 @@ if args.target=='tahoe':
     for name in ('advertising','scanning','randomAddress','extendedConnection'):
         for kind in ('Find','Replace'):
             assert binary.count(table(name+kind, other))==0, ('other set matches', name, kind)
+if args.set!='2672':
+    #: the extended-scan Filter_Duplicates site, one pattern per build set.
+    find,replace=table('dupFilterFind',''),table('dupFilterReplace','')
+    if binary.count(find)==0 and binary.count(replace)==1:
+        binary=binary.replace(replace,find)
+        print('dupFilter: this read returned the patched page, checked against the original bytes')
+    if binary.count(find)!=1:
+        raise SystemExit('dupFilter pattern matches %d times'%binary.count(find))
+    offset=binary.index(find)
+    assert offset//4096==(offset+len(find)-1)//4096,'pattern crosses a page'
+    assert len(find)==len(replace) and binary.count(replace)==0
+    # The new code stores the scan type as before, an immediate 0 to the filter byte (movb $0,3(reg)), then a short jmp
+    # that lands exactly after the pattern; the bytes after the jmp are the original ones, now unreachable.
+    jumps=[j for j in range(len(replace)-1) if replace[j]==0xeb and j+2+replace[j+1]==len(find)]
+    assert len(jumps)==1,jumps
+    j=jumps[0]
+    assert replace[j+2:]==find[j+2:]
+    assert any(replace[i]==0xc6 and replace[i+2:i+4]==b'\x03\x00' for i in range(j-3)),'no movb $0,3(reg)'
 label=args.target+(' '+args.set if args.target=='tahoe' else '')
 print('BTLEAdvFixup %s patterns: passed against %s (no controller test)'%(label,args.binary))

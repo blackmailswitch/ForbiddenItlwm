@@ -15,6 +15,8 @@ program+=r'''
 struct Loop { bool inGate() { return true; } };
 static IOReturn enqueueResult=0; static unsigned enqueues=0,headroomCalls=0,linkCalls=0,lastLink=0;
 static ItlSkywalkPacketView *enqueued=nullptr;
+static volatile uint32_t itlAWDLRxParseBad, itlAWDLRxNotOurs, itlAWDLRxSelf, itlAWDLRxAllocFail, itlAWDLRxPrepFail,
+    itlAWDLRxCopyFail, itlAWDLRxQueueFail, itlAWDLRxDelivered, itlAWDLRxDisabled, itlAWDLRxMetaOther, itlAWDLRxMetaLast;
 static IOReturn itlPacketSetHeadroom(ItlSkywalkPacketView*,unsigned char h) { assert(!h);++headroomCalls;return 0; }
 static IOReturn itlPacketSetLinkHeaderLength(ItlSkywalkPacketView*,unsigned char n) { ++linkCalls;lastLink=n;return 0; }
 static IOReturn itlRxEnqueue(void *q,ItlSkywalkPacketView *const *p,unsigned n,unsigned o) {
